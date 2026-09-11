@@ -249,3 +249,39 @@ Goal: use this local model as Codex CLI's backend with full parity to a real hos
 - A tiny local logging HTTP proxy (plain `http.server` in Python, forwards to `127.0.0.1:18081` while writing the request/response body to a file) placed in front of the server via `-c model_providers.lucebox.base_url=http://127.0.0.1:<proxy_port>/v1` is the fastest way to see *exactly* what Codex sends and what our server streams back, without needing `tcpdump` (not installed in this container).
 - `strace -f -tt -e trace=write -o <file> <cmd>` (run inside `script -qc "..." <screenlog>` so Codex still detects a real TTY) gives ground-truth timing of what a CLI actually writes to its own stdout, independent of any test-harness-induced buffering (e.g. piping through `grep`, or `script --timing`'s coarser granularity, both of which can make genuinely-incremental output look like one burst).
 - `strings <the codex binary>` (a compiled, locally-installed CLI we run — not decompiling anything we don't already execute) is a legitimate way to recover exact field/enum names for undocumented parts of a wire protocol; confirmed a "known-invalid value" error message from Codex's own Rust deserializer (`unknown variant 'function', expected 'freeform'`) is an even faster way to get the exact valid enum set directly from the tool itself.
+
+## Bug 7: KVFlash pool-seeding — long sessions past the pool paid full reprefill every turn (fixed)
+
+**Symptom:** once a session's cumulative context permanently exceeded the KVFlash
+resident pool (16384 tokens on this card), `snapshot_save()` refuses to save
+forever (`cache_.cur_pos > kvflash_tokens_` guard in `qwen35_backend.cpp`), so
+`http_server.cpp` can never again find a restore slot and always calls plain
+`generate()` with the full cumulative prompt — a ~24-34s full pooled/evicting
+reprefill, repeating on **every** round-trip for the rest of that session/agent
+loop. This is the actual mechanism behind "every message takes minutes with no
+token output" once a long agent session runs past the pool.
+
+**Fix (`qwen35_backend.h`/`.cpp`):** since the live KVFlash pool + recurrent
+state are never torn down between HTTP requests on the same backend instance
+(single FIFO worker, no other session interleaved), a new request that's a
+genuine extension of the previous one can skip `kvflash_pager_.reset()` and the
+recurrent-state reset, and only prefill the new suffix directly onto the
+already-resident pool. `do_prefill()` gained a `kv_pool_continue` flag; a new
+`kvflash_prompt_boundary_pos_` member tracks the end of the last genuine
+*client* prompt (not `cache_.cur_pos`, which also includes this backend's own
+raw generated tokens — not safe to match against a freshly re-rendered next
+prompt, since chat-template retokenization at a message boundary is not
+guaranteed byte-stable). `generate_impl()` computes a **longest-common-prefix**
+match (not strict equality) against `kvflash_history_[0, boundary)` before
+deciding whether to reset; any divergence (including the model's own last
+reply) is simply reprocessed as part of the delta — always correct, just less
+of a speedup when the match is short.
+
+**Verified:** cold (post-restart) full reprefill of a ~24k-token conversation
+vs. the same conversation continued incrementally produced the identical
+answer (33.8s cold vs 0.2s continued, both correct); 10 consecutive
+arithmetic-check turns past the pool boundary all correct at ~0.2s each
+instead of ~24-34s; short in-pool sessions still use the existing
+snapshot-restore path unaffected (`restore=true` unchanged there); a genuine
+conversation switch (near-zero LCP) correctly falls back to a near-full
+reprefill, no corruption.
