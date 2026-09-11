@@ -100,7 +100,7 @@ namespace dflash::common {
 
 namespace {
 constexpr auto kClientMonitorInterval = std::chrono::milliseconds(250);
-constexpr auto kSseHeartbeatInterval = std::chrono::seconds(15);
+constexpr auto kSseHeartbeatInterval = std::chrono::seconds(3);
 constexpr auto kReadClosedProbeInterval = std::chrono::seconds(1);
 constexpr char kSseHeartbeat[] = ": keep-alive\n\n";
 }
@@ -4408,6 +4408,34 @@ void HttpServer::process_job(ServerJob * job) {
     GenerateResult result;
     if (using_restore) {
         result = backend_.restore_and_generate(cache_slot, gen_req, io);
+        if (!result.ok() &&
+            result.error_code() == generate_error_code(GenerateErrorCode::PrefillFailed)) {
+            // KVFlash's pooled/evicting prefill path (needed once a prompt
+            // exceeds the resident pool) cannot restore from an offset — a
+            // relocated/paged prefix can't be resumed identity-style (see
+            // qwen35_backend.cpp's kvf_paged + kv_offset != 0 check). This
+            // combination is real, not theoretical: once a resumed
+            // conversation's cached prefix plus this turn's new content
+            // crosses the pool boundary, every restore attempt hits it and
+            // previously failed outright (ok=false, out=0) while the client
+            // saw only "nothing happened" — the exact silent-failure shape
+            // documented in HANDOVER.md's KVFlash/agent-turn-cache
+            // postmortem, now reached via the *ordinary* prefix cache rather
+            // than agent-turn-cache. Recover by discarding the restore and
+            // pooled-prefilling the full prompt fresh instead — the pooled
+            // path handles a from-scratch prompt of this size fine (verified
+            // throughout this session); it just cannot resume a restore into
+            // it.
+            std::string detail(result.error_detail());
+            std::fprintf(stderr,
+                "[server] restore incompatible with pooled prefill (%s); "
+                "retrying as a fresh prefill of the full %zu-token prompt\n",
+                detail.empty() ? "prefill_failed" : detail.c_str(),
+                effective_prompt.size());
+            GenerateRequest fresh_req = gen_req;
+            fresh_req.prompt = effective_prompt;
+            result = backend_.generate(fresh_req, io);
+        }
     } else {
         result = backend_.generate(gen_req, io);
     }
