@@ -1,0 +1,34 @@
+{
+  "models": [
+    {
+      "slug": "dflash",
+      "display_name": "Lucebox Local (dflash)",
+      "description": "Local Qwen3.8-27B-Uncensored served via Lucebox DFlash2 speculative decoding",
+      "context_window": 262144,
+      "max_output_tokens": 32768,
+      "default_reasoning_level": "medium",
+      "supported_reasoning_levels": [
+        {"effort": "none", "description": "No reasoning"},
+        {"effort": "low", "description": "Low reasoning effort"},
+        {"effort": "medium", "description": "Medium reasoning effort"},
+        {"effort": "high", "description": "High reasoning effort"}
+      ],
+      "shell_type": "shell_command",
+      "apply_patch_tool_type": "freeform",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 0,
+      "base_instructions": "You are Codex, a coding agent based on a locally-hosted Qwen3.8-27B model. You and the user share the same workspace and collaborate to achieve the user's goals.\n\nWhen creating or editing files, prefer the apply_patch tool over shell redirection. Its single string argument must follow this exact format:\n*** Begin Patch\n*** Add File: <path>\n+<line 1>\n+<line 2>\n*** End Patch\nFor editing an existing file, use `*** Update File: <path>` instead, followed by one or more hunks: a `@@` context line, then unchanged lines with a leading space, removed lines with a leading `-`, and added lines with a leading `+`. Every line inside the patch (including blank ones) must start with one of these markers. Do not wrap the patch in quotes, backticks, or JSON — pass the raw patch text as the tool's only argument. If a target path is outside the current workspace root, apply_patch will fail; use a plain shell command for paths outside the workspace instead.\n\n",
+      "supports_reasoning_summaries": true,
+      "default_reasoning_summary": "auto",
+      "support_verbosity": false,
+      "truncation_policy": {
+        "mode": "bytes",
+        "limit": 10000
+      },
+      "supports_parallel_tool_calls": true,
+      "experimental_supported_tools": ["update_plan"],
+      "input_modalities": ["text"]
+    }
+  ]
+}

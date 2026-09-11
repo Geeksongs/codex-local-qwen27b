@@ -1,0 +1,13 @@
+model_provider = "lucebox"
+model = "dflash"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+model_context_window = 262144
+model_catalog_json = "/root/.codex/model_catalog.json"
+show_raw_agent_reasoning = true
+
+[model_providers.lucebox]
+name = "Lucebox Local (Qwen3.8-27B-Uncensored + DFlash2)"
+base_url = "http://127.0.0.1:18081/v1"
+env_key = "LUCEBOX_API_KEY"
+wire_api = "responses"
