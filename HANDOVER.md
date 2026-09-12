@@ -285,3 +285,67 @@ instead of ~24-34s; short in-pool sessions still use the existing
 snapshot-restore path unaffected (`restore=true` unchanged there); a genuine
 conversation switch (near-zero LCP) correctly falls back to a near-full
 reprefill, no corruption.
+
+## OpenCode integration — blank-screen bug resolved, default model fixed
+
+**Symptom (previously unresolved):** OpenCode's interactive TUI appeared to
+hang/blank on startup or use.
+
+**Root cause, on reinvestigation:** a global `npm install -g opencode-ai`
+skipped its `postinstall.mjs` script by default (npm's `install-scripts`
+allowlisting), which is what selects and stages the correct native TUI
+binary (`opencode-linux-x64` vs `-baseline`, AVX2-detected) into `bin/`.
+Combined with stale `~/.local/share/opencode/opencode.db*` /
+`~/.cache/opencode` state left over from earlier crashed test sessions,
+this produced a TUI that never rendered past its initial blank-fill frame.
+
+**Fix:** clean reinstall with scripts explicitly allowed, and wiped
+state/cache:
+```
+npm uninstall -g opencode-ai
+rm -rf ~/.cache/opencode ~/.local/share/opencode ~/.local/state/opencode ~/.config/opencode
+npm install -g --allow-scripts=opencode-ai opencode-ai@latest
+```
+**Verified** via real pty-driven TUI automation (`tools/opencode_tui_smoke_test.py`):
+logo → prompt box → "Thinking" spinner → streamed reply, all within a few
+seconds; no blank screen across multiple fresh launches.
+
+**Separately found and fixed:** the project's `opencode.json` only declared
+the `lucebox` provider but never set it as the *default* model, so OpenCode
+fell back to its own bundled free cloud model ("Big Pickle" / OpenCode Zen)
+until a user manually ran `ctrl+x m` and picked "Lucebox Local (dflash)"
+every session. Added top-level `"model": "lucebox/dflash"` and
+`"small_model": "lucebox/dflash"` to `opencode/opencode.json` (mirrors
+`/workspace/opencode.json`) so the local Qwen/DFlash2 backend is used from
+the first message, no manual switch needed. Confirmed via server-side
+request logs that a model switch to `lucebox/dflash` produces a real
+prefill/decode round-trip on our `dflash_server`, not the cloud fallback.
+
+## Persistent test tooling (`tools/`)
+
+Reusable regression harnesses, meant to be run first whenever someone
+reports "Codex/OpenCode isn't working" before any speculative debugging:
+
+- **`tools/codex_tui_probe.py`** — drives the real interactive `codex` TUI
+  through a pty (Kitty keyboard protocol encoding — plain ASCII writes are
+  silently dropped once Codex's TUI enters Kitty keyboard mode) across a
+  scenario battery (single/parallel shell commands, apply_patch file
+  creation, writing actual code and running it, editing existing code,
+  reading files back, long-running commands, multi-step sequencing) and
+  multiple exit/`codex resume --last` cycles, including a dedicated
+  "interrupt mid-task" probe: start a real multi-file coding task, force-exit
+  while it's still working, bounce through several more exit/resume hops
+  without finishing it, then finally ask it to complete the task and
+  independently verify the resulting file on disk. Scans every transcript
+  for known failure signatures (`missing field`, `Fatal error`,
+  `invoked with incompatible payload`, stalls with no output, etc.).
+  `python3 codex_tui_probe.py --cycles N --scenario-timeout SECONDS`.
+- **`tools/kvflash_continuation_test.py`** — plain HTTP regression test for
+  the KVFlash pool-continuation fix: forces a session past the resident
+  pool, then checks that subsequent turns both answer correctly (known
+  arithmetic) and engage the fast continuation path (<5s vs ~24-34s cold).
+- **`tools/opencode_tui_smoke_test.py`** — pty-driven OpenCode TUI check:
+  confirms the UI actually renders (catches the blank-screen bug's
+  reappearance), the configured local model is the active default (catches
+  the OpenCode-Zen-fallback bug's reappearance), and a real message
+  round-trips to a reply.
