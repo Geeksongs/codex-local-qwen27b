@@ -4,17 +4,20 @@ keyscan — 在 GitHub 的 LLM agent 项目里挖 LLM API key 并验证有效性
 
 流程:
   1. 用 GitHub Search API 批量搜 "llm agent" 相关仓库 (可离线: --repos 直接给列表)
-  2. 对每个仓库做 shallow clone (带历史), 用 git log -p 扫全部 commit 的 diff
+  2. 对每个仓库做 shallow clone (--depth 200), 双扫描:
+     - git log -p 扫 commit 历史 (已删除的 key)
+     - grep 工作区扫当前文件 (存在的 key)
   3. 用一组正则识别各家 LLM 的 key (OpenAI/Anthropic/Gemini/Mistral/DeepSeek/...)
   4. 对每个 key 调对应 provider 的 /models 端点验证有效性
-  5. 结果写 JSON + 打印表格
+  5. 结果写 JSON + CSV (只存 valid) + 打印表格
+  6. 扫完即删 clone 目录, 节省磁盘
 
 用法:
-  python3 keyscan.py --max-repos 50 --max-commits 2000 --workers 8
+  python3 keyscan.py --max-repos 50 --workers 10
   python3 keyscan.py --repos owner/repo,owner/repo2   # 离线, 跳过搜索
   python3 keyscan.py --token $GITHUB_TOKEN            # 提高 API 限额
 """
-import argparse, json, os, re, subprocess, sys, time, shutil, hashlib
+import argparse, json, os, re, subprocess, sys, time, shutil, hashlib, csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -69,7 +72,6 @@ def gh_get(url, token=None, retries=3):
                 return json.load(r)
         except HTTPError as e:
             if e.code in (403, 429) and i < retries - 1:
-                # rate limit — 读 reset
                 reset = e.headers.get("X-RateLimit-Reset")
                 wait = 2 ** i * 2
                 if reset:
@@ -90,18 +92,78 @@ def gh_get(url, token=None, retries=3):
             raise
     return None
 
-def search_repos(token, queries, per_query=30, max_repos=100):
-    """返回去重后的 [owner/repo, ...]"""
+# ---------------------------------------------------------------------------
+# 2b. 大厂/官方 org 判断: 用本地 LLM (Qwen3.8-27B) 判断, 带缓存
+# ---------------------------------------------------------------------------
+_LLM_CACHE = {}
+_LLM_URL = "http://127.0.0.1:18097/v1/chat/completions"
+
+def is_big_corp(owner, llm_url=_LLM_URL):
+    """用本地 LLM 判断 owner 是否是大厂/官方 org。
+    返回 True=大厂(应排除), False=个人/创业公司(保留)。
+    结果缓存, 同一 owner 只问一次。LLM 不可用时回退到硬编码列表。
+    """
+    owner_l = owner.lower()
+    if owner_l in _LLM_CACHE:
+        return _LLM_CACHE[owner_l]
+    FALLBACK = {
+        "nvidia", "nvidia-ai-blueprints", "langchain-ai", "microsoft", "google",
+        "googleapis", "openai", "anthropics", "meta", "facebook", "apple",
+        "amazon", "aws", "netflix", "airbnb", "uber", "lyft", "stripe",
+        "salesforce", "sap", "oracle", "ibm", "intel", "amd", "qualcomm",
+        "crewaiinc", "huggingface", "together-ai", "ai21labs", "cohere-ai",
+        "mistralai", "deepseek-ai", "zhipuai", "moonshotai", "minimax-ai",
+        "replicate", "perplexity-ai", "groq", "fireworks-ai", "openrouter",
+        "pytorch", "tensorflow", "keras", "scikit-learn", "pandas-dev",
+        "numpy", "django", "pallets", "encode", "tiangolo", "fastapi",
+        "docker", "kubernetes", "hashicorp", "ansible", "terraform",
+        "vercel", "netlify", "heroku", "railway", "fly-io",
+    }
+    try:
+        prompt = (f"GitHub org/user name: '{owner}'. "
+                  f"Is this a big tech company or official AI framework org "
+                  f"(like Microsoft, Google, NVIDIA, OpenAI, Meta, Amazon, Apple, "
+                  f"HuggingFace, LangChain, CrewAI, etc.)? "
+                  f"Answer ONLY 'yes' or 'no'.")
+        req = Request(llm_url, method="POST",
+                      headers={"Content-Type": "application/json"},
+                      data=json.dumps({
+                          "model": "dflash",
+                          "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 5,
+                          "temperature": 0,
+                      }).encode())
+        with urlopen(req, timeout=10) as r:
+            resp = json.load(r)
+            answer = resp["choices"][0]["message"]["content"].strip().lower()
+        result = answer.startswith("yes")
+    except Exception:
+        result = owner_l in FALLBACK
+    _LLM_CACHE[owner_l] = result
+    return result
+
+def search_repos(token, queries, per_query=30, max_repos=100,
+                 stars="50..2000", pushed=">2026-03-18"):
+    """返回去重后的 [owner/repo, ...]
+    裸 API (无 token) 限额 10 次/分钟, 每查询最多 2 页, 查询间 sleep 7s。
+    用 LLM 排除大厂/官方 org。
+    """
     seen, out = set(), []
-    for q in queries:
-        for page in range(1, 4):  # 最多 3 页/查询
-            url = (f"{GH_API}/search/repositories?q={q.replace(' ', '+')}"
+    for qi, q in enumerate(queries):
+        if qi > 0:
+            time.sleep(7)  # 避免裸 API rate limit
+        query = f"{q} stars:{stars} pushed:{pushed}"
+        for page in range(1, 3):  # 最多 2 页/查询
+            url = (f"{GH_API}/search/repositories?q={query.replace(' ', '+')}"
                    f"&per_page={per_query}&page={page}&sort=updated")
             data = gh_get(url, token)
             if not data or not data.get("items"):
                 break
             for it in data["items"]:
                 full = it["full_name"]
+                owner = full.split("/")[0].lower()
+                if is_big_corp(owner):
+                    continue
                 if full not in seen:
                     seen.add(full)
                     out.append(full)
@@ -114,60 +176,116 @@ def search_repos(token, queries, per_query=30, max_repos=100):
     return out[:max_repos]
 
 # ---------------------------------------------------------------------------
-# 3. clone + 扫 commit 历史
+# 3. clone + 双扫描 (历史 git log + 工作区 grep)
 # ---------------------------------------------------------------------------
-def clone_repo(full, workdir, depth=None):
+def clone_repo(full, workdir, timeout=300):
+    """clone 仓库。--depth 200 (普通 shallow, 不用 partial filter, 大仓库也快)。"""
     url = f"https://github.com/{full}.git"
     dest = os.path.join(workdir, full.replace("/", "__"))
     if os.path.exists(dest):
         shutil.rmtree(dest, ignore_errors=True)
-    cmd = ["git", "clone", "--quiet", "--filter=blob:none"]
-    if depth:
-        cmd += ["--shallow-since", f"{depth} days"]
-    cmd += [url, dest]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    cmd = ["git", "clone", "--quiet", "--depth", "200", url, dest]
+    r = subprocess.run(cmd, capture_output=True, text=True,
+                       errors="ignore", timeout=timeout)
     if r.returncode != 0:
-        # 退路: 普通 shallow clone
-        cmd2 = ["git", "clone", "--quiet", "--depth", "500", url, dest]
-        r = subprocess.run(cmd2, capture_output=True, text=True, timeout=600)
+        cmd2 = ["git", "clone", "--quiet", "--depth", "50", url, dest]
+        r = subprocess.run(cmd2, capture_output=True, text=True,
+                           errors="ignore", timeout=timeout)
         if r.returncode != 0:
             return None, r.stderr.strip()[-200:]
     return dest, None
 
-def scan_repo(dest, max_commits=2000):
-    """git log -p 扫全部 diff, 返回 [(key, provider, commit, file, line)]"""
+# 工作区扫描: grep 粗筛用的前缀集合
+GREP_PREFIXES = (r"sk-[A-Za-z0-9]|sk-ant-|sk-proj-|AIza[A-Za-z0-9]|"
+                 r"\bkey-[A-Za-z0-9]{10,}|\bgsk_[A-Za-z0-9]|\bhf_[A-Za-z0-9]{10,}|"
+                 r"\br8_[A-Za-z0-9]|\bpplx-[A-Za-z0-9]|\bollama_[A-Za-z0-9]{10,}|"
+                 r"\bsk-or-[A-Za-z0-9]|\bmk-[A-Za-z0-9]{10,}|\beyJ[A-Za-z0-9]{10,}")
+
+# 工作区扫描排除的目录
+EXCLUDE_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__",
+                "dist", "build", ".tox", ".mypy_cache", ".pytest_cache"}
+
+def scan_worktree(dest):
+    """扫 clone 后的工作区所有文件 (当前 HEAD 存在的内容)。
+    grep 粗筛 + 正则精筛, 返回 [{"key","provider","commit":"HEAD","file","line"}]
+    """
     found = []
-    # 用 -p 输出所有改动行; 限制 commit 数
+    exclude_args = []
+    for d in EXCLUDE_DIRS:
+        exclude_args += ["--exclude-dir", d]
+    cmd = ["grep", "-rIl", "-E", GREP_PREFIXES] + exclude_args + [dest]
+    r = subprocess.run(cmd, capture_output=True, text=True,
+                       errors="ignore", timeout=120)
+    if r.returncode not in (0, 1):
+        return found
+    files = [f for f in r.stdout.splitlines() if f.strip()]
+    for fpath in files:
+        rel = os.path.relpath(fpath, dest)
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="ignore") as fh:
+                for line_no, line in enumerate(fh, 1):
+                    for prov, rx, desc in COMPILED:
+                        for m in rx.finditer(line):
+                            key = m.group(0)
+                            if PLACEHOLDER.search(key):
+                                continue
+                            found.append({"key": key, "provider": prov,
+                                          "commit": "HEAD", "file": rel,
+                                          "line": line_no})
+        except (OSError, IOError):
+            continue
+    return found
+
+def scan_repo(dest, max_commits=200, all_refs=False):
+    """双扫描: git log -p 历史 + 工作区 grep, 合并去重。
+    返回 [{"key","provider","commit","file","line"}]
+    """
+    # 1. 历史扫描: git log -p 扫 diff 的 + 行
+    hist = []
     cmd = ["git", "-C", dest, "log", "-p", "-U0", "--no-color",
            f"-n{max_commits}", "--diff-filter=ACMR"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-    if r.returncode != 0:
-        return found
-    out = r.stdout
-    cur_commit = "?"
-    cur_file = "?"
-    line_no = 0
-    for line in out.splitlines():
-        if line.startswith("commit "):
-            cur_commit = line.split()[1][:12]
-            cur_file = "?"
-            line_no = 0
-        elif line.startswith("diff --git"):
-            m = re.search(r" b/(\S+)", line)
-            cur_file = m.group(1) if m else "?"
-            line_no = 0
-        elif line.startswith("+") and not line.startswith("+++"):
-            line_no += 1
-            content = line[1:]
-            for prov, rx, desc in COMPILED:
-                for m in rx.finditer(content):
-                    key = m.group(0)
-                    if PLACEHOLDER.search(key):
-                        continue
-                    found.append({"key": key, "provider": prov,
-                                  "commit": cur_commit, "file": cur_file,
-                                  "line": line_no})
-    return found
+    if all_refs:
+        cmd.append("--all")
+    r = subprocess.run(cmd, capture_output=True, text=True,
+                       errors="ignore", timeout=900)
+    if r.returncode == 0:
+        out = r.stdout
+        cur_commit = "?"
+        cur_file = "?"
+        line_no = 0
+        for line in out.splitlines():
+            if line.startswith("commit "):
+                cur_commit = line.split()[1][:12]
+                cur_file = "?"
+                line_no = 0
+            elif line.startswith("diff --git"):
+                m = re.search(r" b/(\S+)", line)
+                cur_file = m.group(1) if m else "?"
+                line_no = 0
+            elif line.startswith("+") and not line.startswith("+++"):
+                line_no += 1
+                content = line[1:]
+                for prov, rx, desc in COMPILED:
+                    for m in rx.finditer(content):
+                        key = m.group(0)
+                        if PLACEHOLDER.search(key):
+                            continue
+                        hist.append({"key": key, "provider": prov,
+                                     "commit": cur_commit, "file": cur_file,
+                                     "line": line_no})
+    # 2. 工作区扫描
+    wt = scan_worktree(dest)
+    # 3. 合并去重: 按 (key, provider), 历史优先 (保留 commit 信息)
+    merged = {}
+    for h in hist:
+        k = (h["key"], h["provider"])
+        if k not in merged:
+            merged[k] = h
+    for h in wt:
+        k = (h["key"], h["provider"])
+        if k not in merged:
+            merged[k] = h
+    return list(merged.values())
 
 # ---------------------------------------------------------------------------
 # 4. 验证 key 有效性 (调 /models)
@@ -223,13 +341,18 @@ def main():
     ap.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"))
     ap.add_argument("--repos", default=None, help="owner/repo,owner/repo2 (离线)")
     ap.add_argument("--max-repos", type=int, default=50)
-    ap.add_argument("--max-commits", type=int, default=2000)
-    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--max-commits", type=int, default=200)
+    ap.add_argument("--workers", type=int, default=10)
     ap.add_argument("--workdir", default=os.path.join(os.path.dirname(__file__), "repos"))
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "results.json"))
     ap.add_argument("--no-validate", action="store_true")
-    ap.add_argument("--days", type=int, default=0, help="shallow-since N days (0=full)")
-    ap.add_argument("--queries", default="llm agent,ai agent,langchain agent,autogen agent,crewai agent,openai agent")
+    ap.add_argument("--queries", default="llm agent,ai agent,langchain agent,autogen,crewai")
+    ap.add_argument("--all-refs", action="store_true", default=True,
+                    help="git log 加 --all 扫所有分支/tag (默认开)")
+    ap.add_argument("--no-all-refs", dest="all_refs", action="store_false",
+                    help="只扫 HEAD 祖先链")
+    ap.add_argument("--keep-repos", action="store_true",
+                    help="扫完后保留 clone 目录 (默认删除)")
     args = ap.parse_args()
 
     os.makedirs(args.workdir, exist_ok=True)
@@ -245,16 +368,18 @@ def main():
         repos = search_repos(args.token, queries, max_repos=args.max_repos)
         print(f"      得到 {len(repos)} 个仓库", file=sys.stderr)
 
-    # 2+3. clone + 扫描 (并行)
+    # 2+3. clone + 双扫描 (并行, 扫完即删)
     all_hits = []
     def work(full):
-        dest, err = clone_repo(full, args.workdir, depth=args.days or None)
+        dest, err = clone_repo(full, args.workdir, timeout=300)
         if not dest:
             return full, [], err
-        hits = scan_repo(dest, args.max_commits)
+        hits = scan_repo(dest, args.max_commits, all_refs=args.all_refs)
+        if not args.keep_repos:
+            shutil.rmtree(dest, ignore_errors=True)
         return full, hits, None
 
-    print(f"[2/4] clone + 扫描 {len(repos)} 个仓库 (workers={args.workers})...", file=sys.stderr)
+    print(f"[2/4] clone + 双扫描 {len(repos)} 个仓库 (workers={args.workers})...", file=sys.stderr)
     done = 0
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futs = {ex.submit(work, r): r for r in repos}
@@ -286,7 +411,7 @@ def main():
             h["status"] = "skipped"
             h["detail"] = "no-validate"
 
-    # 输出
+    # 输出 JSON
     results = {"generated": time.strftime("%Y-%m-%d %H:%M:%S"),
                "repos_scanned": len(repos),
                "total_candidates": len(all_hits),
@@ -295,10 +420,26 @@ def main():
                "keys": list(uniq.values())}
     with open(args.out, "w") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
+
+    # 输出 CSV: 只存 valid 的 key
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(args.out)), "valid_keys.csv")
+    valid_keys = [h for h in uniq.values() if h.get("status") == "valid"]
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=["provider", "key", "repo", "commit",
+                                          "file", "line", "detail", "generated"])
+        w.writeheader()
+        for h in valid_keys:
+            w.writerow({"provider": h["provider"], "key": h["key"],
+                        "repo": h["repo"], "commit": h["commit"],
+                        "file": h["file"], "line": h["line"],
+                        "detail": h.get("detail", ""),
+                        "generated": results["generated"]})
+
     print(f"\n=== 完成, 耗时 {time.time()-t0:.0f}s ===", file=sys.stderr)
     print(f"扫描仓库: {results['repos_scanned']}  候选: {results['total_candidates']}  "
           f"唯一: {results['unique_keys']}  有效: {results['valid']}", file=sys.stderr)
-    print(f"结果: {args.out}", file=sys.stderr)
+    print(f"结果 JSON: {args.out}", file=sys.stderr)
+    print(f"有效 key CSV: {csv_path} ({len(valid_keys)} 条)", file=sys.stderr)
 
     # 终端表格
     print(f"\n{'STATUS':8} {'PROVIDER':11} {'KEY':24} {'REPO':30} COMMIT")
