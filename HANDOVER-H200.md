@@ -514,3 +514,31 @@ opencode.json`) updated to point at `:18097` with `context: 1572864`.
    the accuracy battery there too, not just the load/OOM check.
 4. Same open items as Session 1/2: `--agent-turn-cache` still off, Codex CLI
    path not re-validated, full interactive OpenCode TUI not smoke-tested.
+
+## Session 4 — OpenCode TUI smoke test (2026-09-18)
+
+Ran `tools/opencode_tui_smoke_test.py` (previously flagged as "not smoke-
+tested" in every prior session's open-follow-ups list) against the current
+1.5M-context production deployment.
+
+**Found and fixed a real bug in the script itself**: `b"\xc2\xb7"`
+(the middle-dot `·` used as a streaming-indicator marker) was written as a
+literal non-ASCII character inside a `b"..."` bytes literal
+(`b"·" in chunk`), which Python rejects outright (`SyntaxError: bytes can
+only contain ASCII literal characters`) — the script could not have run as
+committed. Fixed by encoding it explicitly: `"·".encode() in chunk`.
+
+All three checks pass against the 1.5M deployment:
+
+```
+OK: UI rendered (prompt box visible)
+OK: default model shows expected 'dflash (local H200, 1.5M ctx)' in the footer
+OK: message round-tripped, got a reply
+```
+
+Note the script's `expect_model` default (`"dflash (local)"`) no longer
+matches this session's model display name (`"dflash (local H200, 1.5M
+ctx)"` — set in `opencode.json`'s `provider.lucebox.models.dflash.name`) —
+pass it explicitly as the second CLI arg, or the default footer check will
+`WARN` (not fail) on a name mismatch even though the model is actually
+correct.

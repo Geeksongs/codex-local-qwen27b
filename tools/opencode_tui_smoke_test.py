@@ -92,7 +92,7 @@ def main():
         while time.time() < deadline:
             chunk = drain(fd, 1.5)
             buf += chunk
-            if b"smoketest" in buf and b"·" in chunk:
+            if b"smoketest" in buf and "·".encode() in chunk:
                 got_reply = True
             if chunk == b"" and got_reply:
                 break
