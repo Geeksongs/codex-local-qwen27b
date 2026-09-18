@@ -185,3 +185,112 @@ the original `llama-server.sh`, paths updated for
    branch exists locally with these changes committed but has not been
    pushed to `origin` (`Geeksongs/codex-local-qwen27b`). Needs `gh auth
    login` or a token from the user.
+
+## Session 2 — full parameter sweep + context-length ceiling investigation (2026-09-18)
+
+### Context length: 262144 is a hard ceiling, not a tunable
+
+Checked the GGUF metadata directly (not just the model card prose):
+
+```
+qwen35.context_length = 262144
+qwen35.rope.freq_base = 10000000.0
+qwen35.rope.dimension_count = 64
+```
+
+No `rope.scaling.*` keys of any kind (no YaRN factor, no NTK-aware scaling, no
+linear interpolation). This is the model's native trained context, not an
+artificially-capped value with an extension recipe sitting unused in the
+checkpoint.
+
+Checked whether Lucebox itself can force an extension anyway: grepped the
+whole server source for `yarn`/`rope-scale` CLI flags. **YaRN support exists
+in Lucebox, but only for the `laguna` (Laguna-XS.2) architecture**
+(`src/laguna/laguna_target_loader.cpp` reads `laguna.rope.scaling.factor`
+etc. from GGUF metadata) — there is no equivalent for `qwen35`, and no CLI
+flag (`--rope-freq-scale`, `--yarn-*`, etc.) exposed by `dflash_server`
+generally. `--help` confirms this: zero rope/yarn/scaling flags at all.
+
+**Conclusion**: 262144 is the real ceiling for this model on this engine.
+Extending it would require either (a) engine-side work to add qwen35 YaRN
+support (nontrivial, and unvalidated — RoPE extension without fine-tuning
+measurably degrades long-context recall/coherence past the trained length,
+which conflicts with this deployment's quality floor), or (b) a different
+checkpoint trained/extended further. Not attempted — recommended against
+unless the user explicitly wants to trade quality for a longer nominal
+window.
+
+For scale: 262144 tokens is already near the top of what any local
+open-weight model publishes (most cap at 32K-128K); this is not a small
+number, it's within range of the largest hosted commercial context windows.
+
+### Full parameter sweep (GPU3, quietest of the 4 at sweep time, held constant across all trials for a fair A/B — cross-GPU comparisons earlier in this session were shown to be too noisy to trust)
+
+Base held fixed: target/draft Q8_0, `--max-ctx 262144 --kvflash auto --cache-type-k/v f16`.
+
+**`--ddtree-budget`** (with `--draft-block-size 16`, already-established ceiling):
+
+| budget | decode tok/s | accept_rate |
+|---|---|---|
+| 16 | 172.1 | 0.705 |
+| 18 | 180.3 | 0.632 |
+| 20 | 178.5 | 0.574 |
+| 22 (prior default) | 184.1 / 185.3 / 184.5 | 0.556 |
+| **24 (new default)** | **189.6 / 189.4 / 189.5** | 0.543 |
+| 26 | 186.4 | 0.504 |
+| 28 | 184.2 | 0.472 |
+| 30 | 183.2 | 0.446 |
+| 32 | 164.9 | 0.446 |
+| 36 | 162.6 | 0.403 |
+| 40 | 160.3 | 0.366 |
+
+24 reliably beats 22 by ~3% across 3 repeated trials each (not noise) —
+adopted as the new default. Confirms the shape found on the 24GB card
+(peak then falloff) but the peak moved from 22 to 24 on this hardware/this
+draft pairing. 32+ regresses clearly, same as before — **not** a VRAM
+ceiling this time (H200 has room to spare at budget 40), a genuine
+compute/tree-verification tradeoff.
+
+**Everything else swept at block=16/budget=24 — all within ~1% of each
+other, i.e. no real effect, confirming the same "flat" findings
+`HANDOVER.md` reported on the 24GB card**:
+
+| Flag | Result |
+|---|---|
+| `--specla --specla-top-k 4` | 189.7 tok/s (no change) |
+| `--specla --specla-top-k 8` | 189.4 tok/s (no change) |
+| `--draft-residency persistent` | 189.0 tok/s (no change) |
+| `--chunk 1024` | 190.1 tok/s, prefill 421ms vs 427ms baseline — marginal prefill win, adopted since free |
+| `--chunk 2048` | 189.4 tok/s (no change) |
+| `--kvflash-tau 32` | 189.1 tok/s (no change) |
+| `--kvflash-tau 128` | 189.4 tok/s (no change) |
+
+### Final production config (deployed, running)
+
+```
+--target-device cuda:0 --draft-device cuda:0 \
+--draft-block-size 16 \
+--max-ctx 262144 \
+--kvflash auto \
+--ddtree --ddtree-budget 24 \
+--chunk 1024 \
+--cache-type-k f16 --cache-type-v f16 \
+--prefix-cache-slots 32 --prefill-cache-slots 16
+```
+
+Re-validated on production (GPU0) against the same ~24.8K-token realistic
+prompt used throughout this doc: `ok=true`, decode 79.7 tok/s, prefill 22.6s,
+no OOM. Short-prompt decode varies 144-190 tok/s across checks purely from
+other tenants' load on the shared GPU (confirmed by watching the same exact
+config swing across repeated measurements) — this is now the dominant source
+of variance, not any remaining engine flag.
+
+`supervisor/llama-server-h200.sh` updated to match (`--ddtree-budget 24
+--chunk 1024`).
+
+Not swept (documented as still-open, not because expected to matter):
+`--admission-coalesce-ms`, `--fa-window` (left at 0/full-attention
+deliberately — the docs explicitly warn windowed attention risks tool-use
+correctness at long context, not worth trading for speed here),
+`--agent-turn-cache` (same blocker as Session 1: needs the Bug-7
+continuation fix re-derived against current upstream first).

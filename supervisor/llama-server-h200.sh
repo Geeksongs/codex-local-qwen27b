@@ -18,7 +18,8 @@ cd "${LUCEBOX_DIR}"
   --max-ctx "${REQUIRED_CTX}" \
   --kvflash auto \
   --prefill-drafter "${MODELS_DIR}/drafter/Qwen3-0.6B-Q8_0.gguf" \
-  --ddtree --ddtree-budget 22 \
+  --ddtree --ddtree-budget 24 \
+  --chunk 1024 \
   --cache-type-k f16 --cache-type-v f16 \
   --prefix-cache-slots 32 \
   --prefill-cache-slots 16 \
