@@ -1,0 +1,5 @@
+# keyscan 运行产物 (含扫到的 API key, 勿提交)
+results.json
+valid_keys.csv
+repos/
+__pycache__/
