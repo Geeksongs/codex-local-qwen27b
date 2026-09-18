@@ -542,3 +542,33 @@ ctx)"` — set in `opencode.json`'s `provider.lucebox.models.dflash.name`) —
 pass it explicitly as the second CLI arg, or the default footer check will
 `WARN` (not fail) on a name mismatch even though the model is actually
 correct.
+
+## Session 5 — OpenCode exit/resume stress probe (2026-09-18)
+
+User asked whether OpenCode had an equivalent to `codex_tui_probe.py`'s
+multiple-exit/resume-cycle stress testing. It didn't — that script is
+Codex-CLI-specific (Kitty keyboard protocol, `codex resume --last`) and
+Codex CLI was never set up in this H200 session. Wrote
+`tools/opencode_resume_probe.py` as the OpenCode-side equivalent, using
+`opencode run --continue` (a real subprocess exit + restart each cycle, not
+a REPL loop) instead of PTY-driving the full TUI repeatedly.
+
+Two phases, both run clean against the 1.5M production deployment:
+
+1. **5-cycle context continuity**: plants a token, exits, restarts with
+   `--continue`, asks for the token back -- repeated 5x with the
+   conversation growing each cycle. All 5 cycles recalled correctly.
+2. **Interrupt-mid-task recovery**: starts a real file-write task, SIGTERMs
+   the process 3s in (simulating a closed terminal), resumes with
+   `--continue`, asks it to finish, and checks the actual file content on
+   disk (not just the CLI's claim). Passed.
+
+**Note for whoever runs this next**: `opencode run` in non-interactive mode
+has no TTY to approve a permission prompt, so any tool needing permission
+(file writes included) auto-rejects by default -- the probe's Phase 2 needs
+`--auto` on both the task-starting and the resume call to actually exercise
+the file-write path; this is a real product behavior (correct default for
+unattended runs), not a bug, but it means Phase 2 without `--auto` can look
+like a false failure ("permission requested: external_directory;
+auto-rejecting") that has nothing to do with directory nesting despite the
+message's wording.
