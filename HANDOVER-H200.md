@@ -572,3 +572,46 @@ unattended runs), not a bug, but it means Phase 2 without `--auto` can look
 like a false failure ("permission requested: external_directory;
 auto-rejecting") that has nothing to do with directory nesting despite the
 message's wording.
+
+### Session 5 addendum — Phase 3: real coding task with live-output visibility, added after user follow-up
+
+User asked (a) to actually watch OpenCode write and debug real code, with
+visible incremental "working" output (HANDOVER.md's own open item: the
+"working animation disappears" report was never reproduced, and this session
+wanted to see live tool-call output directly, not just a final answer), and
+(b) to combine that with multiple interrupt/resume cycles, not just the
+simple one-shot file-write task Phase 2 already covered. Added `phase_coding_task()` to `opencode_resume_probe.py`.
+
+**Manual dry run first** (LRU cache implementation + test file + run tests):
+demonstrated real incremental tool-call output streaming as it happened (not
+buffered to one dump), and the model found and fixed a genuine bug in its
+own first draft (`put` on an existing key wasn't updating the stored value)
+via a shown diff, then re-ran tests to confirm the fix -- real agentic
+debugging, not just code generation.
+
+**Two real bugs found and fixed while scripting this as a repeatable
+probe**:
+
+1. **False-pass in test verification**: the model doesn't consistently pick
+   one test-file style across runs -- sometimes `unittest.TestCase` classes,
+   sometimes a bare `assert`-based `__main__` script. Verifying with
+   `python3 -m unittest test_lru_cache -v` silently reports "Ran 0 tests" /
+   rc=0 (a false pass) against the latter style, since discovery finds no
+   `TestCase` subclasses. Fixed by verifying two independent, style-agnostic
+   ways instead: running the test file directly as a script (works either
+   way, as long as it exits non-zero on real failure), plus a hand-written
+   ground-truth exercise of the `LRUCache` class from the probe script
+   itself, so correctness never depends on trusting the model's own test
+   file at all.
+2. **`run_opencode()` crashed instead of reporting a timeout**: on
+   `subprocess.TimeoutExpired`, the partial `stdout`/`stderr` can come back
+   as `bytes` even with `text=True` (the process was killed mid-decode) --
+   concatenating that directly with `str` raised its own `TypeError`,
+   masking the real timeout behind a confusing crash. Fixed with an explicit
+   decode-if-bytes normalizer. Also bumped the default timeout 120s -> 180s
+   after hitting a real one during testing (this shared box's load varies
+   enough that 120s wasn't always enough headroom).
+
+Final (fixed) Phase 3 run: both interrupts landed cleanly, live output was
+visibly incremental at every checkpoint, and both independent verification
+layers passed.
