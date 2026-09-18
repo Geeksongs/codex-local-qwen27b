@@ -5,16 +5,16 @@
   "provider": {
     "lucebox": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Lucebox Local (Qwen3.8-27B-Uncensored + DFlash2, H200)",
+      "name": "Lucebox Local (Qwen3.8-27B-Uncensored + DFlash2, H200, YaRN 1.5M ctx)",
       "options": {
-        "baseURL": "http://127.0.0.1:18081/v1",
+        "baseURL": "http://127.0.0.1:18097/v1",
         "apiKey": "local-no-auth"
       },
       "models": {
         "dflash": {
-          "name": "dflash (local H200)",
+          "name": "dflash (local H200, 1.5M ctx)",
           "limit": {
-            "context": 262144,
+            "context": 1572864,
             "output": 32768
           }
         }

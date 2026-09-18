@@ -294,3 +294,223 @@ deliberately — the docs explicitly warn windowed attention risks tool-use
 correctness at long context, not worth trading for speed here),
 `--agent-turn-cache` (same blocker as Session 1: needs the Bug-7
 continuation fix re-derived against current upstream first).
+
+## Session 3 — YaRN context extension to 1.5M, and a major KVFlash correctness finding (2026-09-18)
+
+User goal: push past the model's native 262144-token ceiling toward the
+officially-documented 1M-token YaRN extension
+(`Qwen/Qwen3.8-27B`'s own README, "Processing Ultra-Long Texts" section).
+
+### YaRN was not wired up in Lucebox for qwen35 target models at all
+
+Confirmed by reading source, not guessing: `ggml`'s YaRN implementation
+(`rope_yarn()` in `ggml-cuda/rope.cu`, the standard Quesnelle/Peng algorithm)
+is fully present and already used elsewhere in this codebase (`laguna`
+target loader, and a narrow "legacy 8-layer drafter" special case) — but
+`TargetWeights` (the qwen35 target's own weight/config struct,
+`src/internal.h`) had no YaRN fields at all, and the qwen35 target's actual
+`ggml_rope_multi()` call sites (`src/qwen35/qwen35_target_graph.cpp`) were
+hardcoded to `n_ctx_orig=0, freq_scale=1.0, ext_factor=0.0` — plain RoPE,
+no override possible from the CLI. `--max-ctx` had no validation against the
+GGUF's native `context_length` either — you could already ask for a huge
+`--max-ctx` and the server would allocate it, it would just silently produce
+degraded/extrapolated output past the trained length with no warning.
+
+**Added target-model YaRN support** (new code, not a patch — this is
+original engineering done this session, not from `codex-local-qwen27b`'s
+`lucebox-patch/`):
+
+- `src/internal.h`: 6 new YaRN fields on `TargetWeights` (mirrors the
+  existing `DraftWeights` fields) plus `native_context_length` (read from
+  the GGUF's own `<arch>.context_length` key in
+  `src/qwen35/gguf_target_loader.cpp`).
+- `src/qwen35/qwen35_target_graph.cpp`: the two `ggml_rope_multi()` call
+  sites (Q and K, inside the function used by all three qwen35 attention
+  block builders) now read `w.rope_n_ctx_orig/freq_scale/ext_factor/
+  attn_factor/beta_fast/beta_slow` from the weights struct instead of the
+  hardcoded disabled values.
+- New CLI flags: `--yarn-factor <F>` (>1.0 enables; unset = fully disabled,
+  byte-for-byte the old behavior), `--yarn-orig-ctx <N>` (default: the
+  GGUF's own native context length), `--yarn-beta-fast`/`--yarn-beta-slow`
+  (ggml/llama.cpp standard defaults 32.0/1.0).
+- Plumbed through the full `BackendArgs -> BackendPlan::Speculation ->
+  Qwen35Config` pipeline (`backend_args.h`, `backend_factory.h`,
+  `backend_plan.cpp`, `backend_factory.cpp` — only the qwen35 non-layer-split
+  branch; layer-split and qwen35moe were not touched, not needed for this
+  single-GPU deployment).
+- `Qwen35Backend::apply_target_yarn_override()` (new method, called from
+  both `init()` and `unpark()` — the second load path exists for VRAM-
+  pressure park/unpark cycling and needs the override re-applied on every
+  reload) sets the override and prints a startup banner, or a `WARNING` to
+  stderr if `--max-ctx` exceeds native length with no `--yarn-factor` set
+  (catches the previously-silent degradation case) or exceeds the
+  YaRN-extended range the given factor actually covers.
+- **Verified backward-compatible**: with no `--yarn-factor`, output and
+  speed are unchanged from before this session (confirmed byte-for-byte
+  coherent short-prompt output, same speed).
+- One debugging note for whoever touches this next: `std::printf` (stdout)
+  in this server is block-buffered when redirected to a file (not
+  line-buffered), so a log line written early in startup may not appear in
+  a tailed log file until much later output forces a flush — this cost real
+  time this session chasing a "why didn't my log line print" false alarm.
+  Use `std::fprintf(stderr, ...)` with an explicit `fflush` for anything
+  you need to see immediately during debugging.
+
+### Major finding: KVFlash silently corrupts long-context retrieval on this hardware — do not use it for anything that needs real long-context recall
+
+This reverses Session 1/2's decision to keep `--kvflash auto`. Built a
+needle-in-haystack test (`~296K`-token haystack of near-duplicate filler
+code, one planted fact, asked to recall it) and ran it under several
+conditions:
+
+| Config | Context | KVFlash | Result |
+|---|---|---|---|
+| YaRN factor=4.0 | 296577 (34K past native) | `auto` (16384 pool) | **WRONG** (`XQ7-ALPHA` vs actual `XQ-7734-ZETA`) |
+| YaRN factor=1.5 | 296577 | `auto` (16384 pool) | **WRONG** (`XQ7-44`) |
+| No YaRN (native) | 243297 (well within 262144) | `auto` (16384 pool) | **WRONG** (`NIGHTINGALE` — total hallucination) |
+| YaRN factor=1.5 | 296577 | **off** (full resident) | **CORRECT** (`XQ-7734-ZETA`, exact) |
+
+The third row is the important control: the failure reproduces with **no
+YaRN involved at all**, entirely within the model's native trained context,
+with KVFlash's pool active. This isolates the bug to KVFlash, not to the
+YaRN work above. Root cause (not fully diagnosed, but well-characterized):
+KVFlash's bounded pool (16384 tokens = ~5.5% of a 296K-token prompt) relies
+on a relevance-scoring drafter (`--prefill-drafter`, confirmed active via
+the startup banner: `policy=drafter (attaches on first reselect)`) to decide
+which chunks stay resident. For this prompt shape — a fact sentence
+embedded in a long run of near-duplicate boilerplate code — that scorer
+evidently fails to keep or recall the relevant chunk. KVFlash's own
+published numbers (`optimizations/kvflash/README.md`) claim 88-100% needle
+recall at 6% residency; this session's real-world result was 0/3. **Prompt
+shape matters and the published benchmark does not transfer to every
+prompt** — do not trust it without testing your own actual workload's shape.
+
+**Consequence for this deployment**: KVFlash is no longer used at all.
+Production runs a full resident KV cache (no bounded pool, no relevance
+scoring, no eviction) — slower to scale VRAM-wise, but the only mode
+verified correct for real retrieval at long context on this hardware.
+
+### KVFlash was also not faster here, reversing the other half of Session 1/2's reasoning
+
+Session 1/2 kept KVFlash partly because its own docs claim full-cache decode
+speed *degrades* with context length on a bandwidth-starved card (13 vs
+38.6 tok/s at 256K on their RTX 3090 reference). Directly measured on H200,
+same ~24.8K-token prompt, only the KVFlash flag changed:
+
+- With `--kvflash auto`: 79.7 tok/s decode
+- Without (full resident): **99.4 tok/s decode** — faster, not slower
+
+And at a short 30-token prompt: 182-190 tok/s with KVFlash vs **280 tok/s**
+without. H200's ~7x memory-bandwidth advantage over the RTX 3090, combined
+with this model's hybrid architecture (only 16 of 64 layers are full
+attention — the rest are linear-attention/SSM, so the "cost scales with
+context" problem KVFlash solves only applies to a quarter of the layers to
+begin with), means the bandwidth-scarcity problem KVFlash was built to solve
+essentially doesn't bite on this hardware+model combination. KVFlash's own
+paging/scoring/eviction bookkeeping becomes pure overhead once that's true.
+**Net effect: disabling KVFlash was a win on both correctness and speed
+here — a reversal, not a tradeoff.**
+
+### VRAM ceiling, mapped empirically (q8_0 KV cache, no KVFlash, this model)
+
+Switching `--cache-type-k/v` from f16 to q8_0 (still within this
+deployment's "q8_0-or-better" quality floor) roughly halved the KV cache's
+VRAM footprint, which is what makes a multi-hundred-GB-scale context
+tractable at all without KVFlash. Ceiling mapped by binary search, each
+point validated against both a trivial prompt and the realistic
+~24.8K-token prompt used throughout this doc (own footprint only, net of
+whatever other tenants were using on the same GPU at measurement time):
+
+| `--max-ctx` | `--yarn-factor` | Own footprint | Margin after a real request | Verdict |
+|---|---|---|---|---|
+| 1,048,576 (1.0M) | 4.0 | ~65 GB | ~39 GB free | safe |
+| **1,572,864 (1.5M)** | **6.0** | **~86 GB** | **~17 GB free** | **safe — deployed** |
+| 1,835,008 (1.75M) | 7.0 | ~95 GB | ~8.6 GB free | works, thin margin, not chosen |
+| 2,097,152 (2.0M) | 8.0 | — | — | **OOM** on the per-request rollback-cache allocation (needs ~3.8 GB it didn't have) |
+
+The 2.0M failure is a clean, reported error (`ok=false`,
+`error=prefill_failed`, `cudaMalloc failed: out of memory` in the log) — not
+a silent corruption, consistent with this engine's general behavior
+(`HANDOVER.md`'s own "always grep for `ok=false`" lesson holds).
+
+**This is a shared box.** All of the above "own footprint" numbers are net
+of whatever else was running on that GPU at measurement time, which moved by
+tens of GB over the course of this session (observed one GPU's other-tenant
+usage go from 53GB to 119GB). A ceiling that fits today is not guaranteed to
+fit tomorrow. 1.5M was chosen over 1.75M specifically for extra headroom
+against exactly this volatility, not because 1.75M didn't technically work.
+
+### The real cost of a large static `--max-ctx`: normal-size requests get slower too, not just VRAM
+
+Ran matched accuracy+speed batteries (5 trials each, short ~3.1K-token and
+medium ~52K-token prompts, distinct planted fact per trial) against two
+servers differing *only* in `--max-ctx`/`--yarn-factor`:
+
+- Accuracy: **100% vs 100%** (5/5 both lengths, both configs) — with
+  KVFlash off, static YaRN at factor=6.0 measurably cost **nothing** in
+  exact-recall accuracy at these lengths in this test. (5 trials per cell —
+  enough to rule out a large effect, not enough to rule out a small one.)
+- Speed: this is where the real cost showed up —
+
+| Length | 262144 ctx, no YaRN | 1.5M ctx, YaRN factor=6.0 | Slowdown |
+|---|---|---|---|
+| ~3.1K tokens | 2.7-3.2s | 6.9-7.3s | **~2.6x** |
+| ~52K tokens | 43.3-43.8s | 111-116s | **~2.6x** |
+
+This ~2.6x tax applies to *every* request once the server is configured for
+1.5M, including ones nowhere near needing it — it's the cost of the larger
+KV-cache/bookkeeping structures being sized for the configured `--max-ctx`
+regardless of how much of it a given request actually uses, not a YaRN-math
+cost (accuracy was unaffected). **This is a genuine, measured tradeoff, not
+a hypothetical one**: a single server that supports up to 1.5M tokens is
+~2.6x slower on typical (short/medium) requests than a server capped at the
+native 262144. A dual-endpoint setup (fast default + on-demand large-context
+endpoint, request routed by expected size) would avoid this but was not
+built this session — flagged as the clear next step if this tax turns out
+to matter in practice for real OpenCode usage.
+
+### Deployed production config
+
+Moved off the original `--target-device cuda:0` convention this session
+started with, onto `cuda:3` (this session's least-loaded GPU — **verify
+current load before assuming this holds**, shared-box usage moves). Old
+`cuda:0`/`cuda:1`/`cuda:2` test instances from earlier in this session were
+torn down; only the `cuda:3` instance remains.
+
+```
+--target-device cuda:3 --draft-device cuda:3 \
+--draft-block-size 16 \
+--max-ctx 1572864 \
+--yarn-factor 6.0 --yarn-orig-ctx 262144 \
+--ddtree --ddtree-budget 24 \
+--cache-type-k q8_0 --cache-type-v q8_0 \
+--host 127.0.0.1 --port 18097
+```
+
+No `--kvflash`, no `--prefix-cache-slots`/`--prefill-cache-slots` overrides
+(defaults apply; these only cache exact-repeated prefixes, e.g. Codex/
+OpenCode's own unchanging system prompt, and are unaffected by the KVFlash
+finding above — that's a completely different code path). `opencode.json`
+(both `~/.config/opencode/opencode.json` and this repo's `opencode/
+opencode.json`) updated to point at `:18097` with `context: 1572864`.
+`supervisor/llama-server-h200.sh` updated to match.
+
+### Open follow-ups from this session
+
+1. **Root-cause KVFlash's actual recall failure mode** rather than just
+   working around it by disabling the feature — would need instrumenting
+   `KvFlashCrossTokScorer`/the drafter-relevance path directly. Not done
+   this session; disabling it was the pragmatic fix given the deployment's
+   correctness requirement.
+2. **The ~2.6x static-max-ctx speed tax** — a dual-endpoint (small fast
+   default + large on-demand) setup would let normal requests keep native-
+   context speed while still offering the 1.5M window for the rare request
+   that needs it. Real engineering work (routing logic, possibly two
+   `dflash_server` processes on separate GPUs with OpenCode/Codex config or
+   a proxy picking between them by estimated prompt size) — scoped but not
+   built this session.
+3. **1.75M / 2.0M were not re-validated with the accuracy battery** (only
+   the 1.5M config was) — if a future session wants to push past 1.5M, redo
+   the accuracy battery there too, not just the load/OOM check.
+4. Same open items as Session 1/2: `--agent-turn-cache` still off, Codex CLI
+   path not re-validated, full interactive OpenCode TUI not smoke-tested.

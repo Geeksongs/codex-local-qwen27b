@@ -1,0 +1,269 @@
+diff --git a/server/src/common/backend_args.h b/server/src/common/backend_args.h
+index ab8301bc..7667bfb8 100644
+--- a/server/src/common/backend_args.h
++++ b/server/src/common/backend_args.h
+@@ -105,6 +105,13 @@ struct BackendArgs {
+     int             verify_width     = 0;  // chain spec verify width; 0 = adaptive
+     bool            use_feature_mirror = false;
+ 
++    // Target-model YaRN context extension (qwen35 only). 0 = disabled
++    // (plain RoPE, unchanged behavior) -- see --yarn-factor in server_main.cpp.
++    float           target_yarn_factor    = 0.0f;
++    float           target_yarn_beta_fast = 32.0f;
++    float           target_yarn_beta_slow = 1.0f;
++    int             target_yarn_orig_ctx  = 0;  // 0 = use GGUF's native context_length
++
+     // MoE backend requests. The server currently realizes these through
+     // environment variables, but admission still treats them as explicit
+     // operator input rather than server-owned context.
+diff --git a/server/src/common/backend_factory.cpp b/server/src/common/backend_factory.cpp
+index 672d0d92..57e2d3ea 100644
+--- a/server/src/common/backend_factory.cpp
++++ b/server/src/common/backend_factory.cpp
+@@ -214,6 +214,10 @@ std::unique_ptr<ModelBackend> construct_backend(
+         cfg.ddtree_chain_seed  = speculation.ddtree_chain_seed;
+         cfg.ddtree_tau         = speculation.ddtree_tau;
+         cfg.use_feature_mirror = speculation.use_feature_mirror;
++        cfg.target_yarn_factor    = speculation.target_yarn_factor;
++        cfg.target_yarn_beta_fast = speculation.target_yarn_beta_fast;
++        cfg.target_yarn_beta_slow = speculation.target_yarn_beta_slow;
++        cfg.target_yarn_orig_ctx  = speculation.target_yarn_orig_ctx;
+ 
+         auto backend = std::make_unique<Qwen35Backend>(std::move(cfg));
+         if (!backend->init()) {
+diff --git a/server/src/common/backend_factory.h b/server/src/common/backend_factory.h
+index 91c1a084..298baa8a 100644
+--- a/server/src/common/backend_factory.h
++++ b/server/src/common/backend_factory.h
+@@ -71,6 +71,11 @@ public:
+         float ddtree_tau = std::numeric_limits<float>::infinity();
+         int verify_width = 0;
+         bool use_feature_mirror = false;
++
++        float target_yarn_factor = 0.0f;
++        float target_yarn_beta_fast = 32.0f;
++        float target_yarn_beta_slow = 1.0f;
++        int target_yarn_orig_ctx = 0;
+     };
+ 
+     // How the backend runs: daemon I/O, prefill chunking, decode-slot
+diff --git a/server/src/common/backend_plan.cpp b/server/src/common/backend_plan.cpp
+index ded8b217..87c659b7 100644
+--- a/server/src/common/backend_plan.cpp
++++ b/server/src/common/backend_plan.cpp
+@@ -158,6 +158,10 @@ BackendPreparation BackendPlanBuilder::resolve(
+     plan.speculation_.ddtree_temp = args.ddtree_temp;
+     plan.speculation_.ddtree_chain_seed = args.ddtree_chain_seed;
+     plan.speculation_.ddtree_tau = args.ddtree_tau;
++    plan.speculation_.target_yarn_factor = args.target_yarn_factor;
++    plan.speculation_.target_yarn_beta_fast = args.target_yarn_beta_fast;
++    plan.speculation_.target_yarn_beta_slow = args.target_yarn_beta_slow;
++    plan.speculation_.target_yarn_orig_ctx = args.target_yarn_orig_ctx;
+     plan.speculation_.verify_width = args.verify_width;
+     plan.speculation_.use_feature_mirror = args.use_feature_mirror;
+ 
+diff --git a/server/src/internal.h b/server/src/internal.h
+index 810ee7f7..776b1e1d 100644
+--- a/server/src/internal.h
++++ b/server/src/internal.h
+@@ -216,6 +216,18 @@ struct TargetWeights {
+     int n_vocab                 = DFLASH27B_TARGET_VOCAB;
+     int rope_dimension_count    = 64;
+     float rope_theta            = 10000000.0f;
++    int native_context_length   = 0;   // GGUF <arch>.context_length; 0 = unknown
++
++    // Target-side YaRN rope scaling (populated from --yarn-* CLI flags;
++    // ext_factor 0 = plain RoPE, unchanged behavior). Mirrors DraftWeights'
++    // fields below -- see qwen35_target_graph.cpp's rope_multi call sites
++    // and ggml's rope_yarn() for the exact math these feed.
++    float rope_freq_scale       = 1.0f;   // 1/factor
++    float rope_ext_factor       = 0.0f;   // >0 enables YaRN interpolation
++    float rope_attn_factor      = 1.0f;
++    float rope_beta_fast        = 32.0f;
++    float rope_beta_slow        = 1.0f;
++    int   rope_n_ctx_orig       = 0;      // original_max_position_embeddings
+     float rms_eps               = 1e-6f;
+     float expert_weights_scale  = 1.0f;
+     int expert_gating_func      = 1;    // 1=softmax, 2=sigmoid (llama.cpp enum values)
+diff --git a/server/src/qwen35/gguf_target_loader.cpp b/server/src/qwen35/gguf_target_loader.cpp
+index 3a869b2f..4db41b6a 100644
+--- a/server/src/qwen35/gguf_target_loader.cpp
++++ b/server/src/qwen35/gguf_target_loader.cpp
+@@ -527,6 +527,7 @@ bool load_target_gguf_partial(const std::string & path,
+     out.ssm_n_group= (int)ssm_grp;
+     out.rope_dimension_count = (int)get_u32_or(gctx, key("rope.dimension_count").c_str(), 64);
+     out.rope_theta = get_f32_or(gctx, key("rope.freq_base").c_str(), 10000000.0f);
++    out.native_context_length = (int)get_u32_or(gctx, key("context_length").c_str(), 0);
+     out.rms_eps = get_f32_or(gctx, key("attention.layer_norm_rms_epsilon").c_str(), 1e-6f);
+     out.expert_gating_func = (int)expert_gating_func;
+     out.expert_weights_scale = expert_weights_scale;
+diff --git a/server/src/qwen35/qwen35_backend.cpp b/server/src/qwen35/qwen35_backend.cpp
+index f184c33a..2ea5e45e 100644
+--- a/server/src/qwen35/qwen35_backend.cpp
++++ b/server/src/qwen35/qwen35_backend.cpp
+@@ -328,6 +328,8 @@ bool Qwen35Backend::init() {
+         return false;
+     }
+     std::printf("[target] %s\n", dflash27b_last_error());
++    apply_target_yarn_override();
++
+     if (cfg_.paged_attention &&
+         (w_.n_embd_head_k != 256 || w_.n_embd_head_v != 256)) {
+         std::fprintf(stderr,
+@@ -671,6 +673,49 @@ bool Qwen35Backend::init() {
+     return true;
+ }
+ 
++void Qwen35Backend::apply_target_yarn_override() {
++    // Disabled (factor<=1.0) leaves w_.rope_ext_factor at its 0.0f default --
++    // byte-identical plain RoPE, same as before this flag existed.
++    if (cfg_.target_yarn_factor <= 1.0f) {
++        if (w_.native_context_length > 0 &&
++            cfg_.device.max_ctx > w_.native_context_length) {
++            std::fprintf(stderr,
++                "[target] WARNING: --max-ctx %d exceeds this model's native "
++                "trained context %d and --yarn-factor was not set -- "
++                "positions beyond %d extrapolate with no correction and "
++                "will degrade; pass --yarn-factor to extend context "
++                "correctly\n",
++                cfg_.device.max_ctx, w_.native_context_length,
++                w_.native_context_length);
++        }
++        return;
++    }
++
++    const int orig_ctx = cfg_.target_yarn_orig_ctx > 0
++        ? cfg_.target_yarn_orig_ctx
++        : (w_.native_context_length > 0 ? w_.native_context_length : 262144);
++    w_.rope_freq_scale  = 1.0f / cfg_.target_yarn_factor;
++    w_.rope_ext_factor  = 1.0f;
++    w_.rope_attn_factor = 1.0f;
++    w_.rope_beta_fast   = cfg_.target_yarn_beta_fast;
++    w_.rope_beta_slow   = cfg_.target_yarn_beta_slow;
++    w_.rope_n_ctx_orig  = orig_ctx;
++    const int extended_max = (int)(orig_ctx * (double)cfg_.target_yarn_factor);
++    std::printf("[target] YaRN enabled: factor=%.2f orig_ctx=%d "
++                "beta_fast=%.1f beta_slow=%.1f -> extended max %d\n",
++                cfg_.target_yarn_factor, orig_ctx,
++                cfg_.target_yarn_beta_fast, cfg_.target_yarn_beta_slow,
++                extended_max);
++    if (cfg_.device.max_ctx > extended_max) {
++        std::fprintf(stderr,
++            "[target] WARNING: --max-ctx %d exceeds the YaRN-extended range "
++            "%d*%.2f=%d -- positions beyond that extrapolate with no "
++            "correction; lower --max-ctx or raise --yarn-factor\n",
++            cfg_.device.max_ctx, orig_ctx, cfg_.target_yarn_factor,
++            extended_max);
++    }
++}
++
+ bool Qwen35Backend::load_target_model(ggml_backend_t backend, TargetWeights & out) {
+     return load_target_gguf(cfg_.target_path, backend, out);
+ }
+@@ -910,6 +955,7 @@ bool Qwen35Backend::unpark(ParkTarget target) {
+             std::fprintf(stderr, "[unpark] target: %s\n", dflash27b_last_error());
+             return false;
+         }
++        apply_target_yarn_override();
+         kvflash_drafter_failed_ = false;   // fresh VRAM: allow a retry
+         target_parked_ = false;
+         std::printf("[unpark] target restored\n"); std::fflush(stdout);
+diff --git a/server/src/qwen35/qwen35_backend.h b/server/src/qwen35/qwen35_backend.h
+index e55671b9..d743cee1 100644
+--- a/server/src/qwen35/qwen35_backend.h
++++ b/server/src/qwen35/qwen35_backend.h
+@@ -83,6 +83,12 @@ struct Qwen35Config {
+     float        draft_yarn_beta_slow = 1.0f;
+     int          draft_yarn_orig_ctx  = 4096;
+ 
++    // Target YaRN rope scaling (--yarn-factor etc, qwen35 only).
++    float        target_yarn_factor    = 0.0f;  // 0 = no YaRN; >1 = enable
++    float        target_yarn_beta_fast = 32.0f;
++    float        target_yarn_beta_slow = 1.0f;
++    int          target_yarn_orig_ctx  = 0;  // 0 = use GGUF's native context_length
++
+     // Speculative decode strategy
+     bool         fast_rollback   = true;
+     bool         seq_verify      = false;
+@@ -173,6 +179,10 @@ public:
+ 
+ protected:
+     virtual bool load_target_model(ggml_backend_t backend, TargetWeights & out);
++    // Applies --yarn-factor etc to w_ right after every (re)load. No-op when
++    // target_yarn_factor <= 1.0 (the default), leaving w_'s YaRN fields at
++    // their disabled defaults.
++    void apply_target_yarn_override();
+     virtual bool run_ar_decode_path(int committed, int n_gen,
+                                     std::vector<int32_t> & out_tokens,
+                                     const DaemonIO & io);
+diff --git a/server/src/qwen35/qwen35_target_graph.cpp b/server/src/qwen35/qwen35_target_graph.cpp
+index f0cd8ef8..e6b5d431 100644
+--- a/server/src/qwen35/qwen35_target_graph.cpp
++++ b/server/src/qwen35/qwen35_target_graph.cpp
+@@ -1206,12 +1206,14 @@ static ggml_tensor * build_full_attn_block(
+ 
+     Q = ggml_rope_multi(ctx, Q, positions, /*freq_factors=*/nullptr,
+                         n_rot, sections, GGML_ROPE_TYPE_MROPE,
+-                        /*n_ctx_orig=*/0, w.rope_theta, 1.0f,
+-                        0.0f, 1.0f, 0.0f, 0.0f);
++                        w.rope_n_ctx_orig, w.rope_theta, w.rope_freq_scale,
++                        w.rope_ext_factor, w.rope_attn_factor,
++                        w.rope_beta_fast, w.rope_beta_slow);
+     Kcur = ggml_rope_multi(ctx, Kcur, positions, nullptr,
+                            n_rot, sections, GGML_ROPE_TYPE_MROPE,
+-                           0, w.rope_theta, 1.0f,
+-                           0.0f, 1.0f, 0.0f, 0.0f);
++                           w.rope_n_ctx_orig, w.rope_theta, w.rope_freq_scale,
++                           w.rope_ext_factor, w.rope_attn_factor,
++                           w.rope_beta_fast, w.rope_beta_slow);
+ 
+     if (q_tail_capture) {
+         const int chunk_lo = kv_start;
+diff --git a/server/src/server/server_main.cpp b/server/src/server/server_main.cpp
+index 8382a7c0..c26a2141 100644
+--- a/server/src/server/server_main.cpp
++++ b/server/src/server/server_main.cpp
+@@ -154,6 +154,17 @@ static void print_usage(const char * prog) {
+         "  --ddtree-budget <N>  DDTree budget (default: 22)\n"
+         "  --ddtree-tau <T>     Confidence margin on cumulative log-prob\n"
+         "                       (default: 6 with --specla; otherwise off)\n"
++        "  --yarn-factor <F>    Enable YaRN rope scaling on the target model\n"
++        "                       (qwen35 only) to extend context past the\n"
++        "                       GGUF's native trained length, e.g. 4.0 for a\n"
++        "                       4x extension. Unset = disabled (plain RoPE,\n"
++        "                       unchanged behavior). Set --max-ctx to match\n"
++        "                       the extended length you actually want.\n"
++        "  --yarn-orig-ctx <N>  Original (pre-extension) context length for\n"
++        "                       the YaRN ramp calc. Default: the GGUF's own\n"
++        "                       native context_length.\n"
++        "  --yarn-beta-fast <F> YaRN low-frequency correction dim (default: 32)\n"
++        "  --yarn-beta-slow <F> YaRN high-frequency correction dim (default: 1)\n"
+         "  --verify-width <N>   laguna chain spec verify width (default: base 8,\n"
+         "                       trimmed per step by drafter confidence; N = fixed base)\n"
+         "  --adaptive-experts [tau]  MoE expert-count gating on verify batches\n"
+@@ -600,6 +611,25 @@ static int parse_model_options(int argc, char ** argv, ModelOptions & model,
+             }
+             bargs.ddtree_tau = tau;
+             bargs.ddtree_tau_explicit = true;
++        } else if (std::strcmp(argv[i], "--yarn-factor") == 0 && i + 1 < argc) {
++            const char * value = argv[++i];
++            char * end = nullptr;
++            errno = 0;
++            const float f = std::strtof(value, &end);
++            if (errno == ERANGE || end == value || *end != '\0' ||
++                !std::isfinite(f) || f <= 1.0f) {
++                std::fprintf(stderr,
++                    "--yarn-factor expects a finite number > 1.0 (e.g. 4.0 for "
++                    "a 4x context extension), got '%s'\n", value);
++                return 2;
++            }
++            bargs.target_yarn_factor = f;
++        } else if (std::strcmp(argv[i], "--yarn-orig-ctx") == 0 && i + 1 < argc) {
++            bargs.target_yarn_orig_ctx = std::atoi(argv[++i]);
++        } else if (std::strcmp(argv[i], "--yarn-beta-fast") == 0 && i + 1 < argc) {
++            bargs.target_yarn_beta_fast = std::strtof(argv[++i], nullptr);
++        } else if (std::strcmp(argv[i], "--yarn-beta-slow") == 0 && i + 1 < argc) {
++            bargs.target_yarn_beta_slow = std::strtof(argv[++i], nullptr);
+         } else if (std::strcmp(argv[i], "--adaptive-experts") == 0) {
+             const char * tau = "0.80";
+             if (i + 1 < argc && argv[i + 1][0] != '-') {

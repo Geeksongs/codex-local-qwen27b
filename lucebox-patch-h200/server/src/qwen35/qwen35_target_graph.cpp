@@ -1,0 +1,3579 @@
+// Forward pass of Qwen3.5-27B (qwen35 hybrid) in pure ggml.
+//
+// Translates llama.cpp's `src/models/qwen35.cpp` + `delta-net-base.cpp` into
+// our standalone library, hardcoded for Qwen3.5-27B dimensions. No
+// llama.cpp runtime is linked — only ggml ops.
+//
+// Architecture highlights:
+//   - 64 layers; every 4th (il % 4 == 3) is full attention, rest are Gated DeltaNet
+//   - Full-attention Q projection is PACKED with a gate (attn_q has width 2*q_dim)
+//   - Full attention uses M-RoPE with sections [11,11,10,0]
+//   - Flash attention is GQA 24/4, causal
+//   - Delta-net uses ggml_ssm_conv for the 1D conv + ggml_gated_delta_net for the recurrence
+//   - FFN is SwiGLU (w_gate * silu, element-wise multiply with w_up, then w_down)
+//
+// State (persisted in TargetCache across calls):
+//   - attn_k[16], attn_v[16]     : KV cache for full-attn layers, f16
+//   - conv_state[48]             : 1D conv recurrence state, f32
+//   - ssm_state[48]              : delta-net recurrent state (head_v^2 × H_v), f32
+//
+// Key dimensions (all hardcoded via DFLASH27B_* macros):
+//   n_embd           = 5120
+//   n_head           = 24    head_dim = 256   q_dim = n_head * head_dim = 6144
+//   n_head_kv        = 4     kv_dim = 4 * 256 = 1024
+//   n_ff             = 17408
+//   d_inner (ssm)    = 6144
+//   d_state (ssm)    = 128
+//   dt_rank (ssm)    = 48    (num_v_heads)
+//   n_group (ssm)    = 16    (num_k_heads)
+//   head_v_dim       = d_inner / dt_rank = 128
+//   head_k_dim       = d_state           = 128
+//   conv_kernel      = 4
+
+#include "internal.h"
+#include "bailingmoe3_graph.h"
+#include "delta_net_chunked.h"
+#include "delta_net_specla.h"
+#include "kv_quant.h"
+#include "qwen35_ops.h"
+#include "qwen35moe_ffn.h"
+#include "common/chain_rollback_policy.h"
+#include "common/kv_rotation.h"
+#include "common/specla_commit_cuda.h"
+
+#include "ggml-alloc.h"
+#include "ggml-backend-impl.h"
+#include "ggml-cuda.h"
+
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace dflash::common {
+
+// ─── Local qwen35 constants (from the GGUF, hardcoded for this model) ─
+// These complement the DFLASH27B_* macros in dflash27b.h with qwen35-specific
+// hparams that differ from the draft (which uses plain Qwen3 dims).
+namespace q35 {
+constexpr int N_HEAD        = 24;
+constexpr int N_HEAD_KV     = 4;
+constexpr int HEAD_DIM      = 256;   // key_length == value_length
+constexpr int Q_DIM         = N_HEAD * HEAD_DIM;    // 6144
+constexpr int KV_DIM        = N_HEAD_KV * HEAD_DIM; // 1024
+constexpr int FFN_DIM       = 17408;
+
+constexpr int SSM_D_INNER   = 6144;
+constexpr int SSM_D_STATE   = 128;
+constexpr int SSM_DT_RANK   = 48;
+constexpr int SSM_N_GROUP   = 16;
+constexpr int SSM_CONV_KERN = 4;
+
+// Derived
+constexpr int HEAD_V_DIM    = SSM_D_INNER / SSM_DT_RANK;  // 128
+constexpr int HEAD_K_DIM    = SSM_D_STATE;                // 128
+constexpr int CONV_CHANNELS = SSM_D_INNER + 2 * SSM_N_GROUP * SSM_D_STATE; // 6144 + 2*16*128 = 10240
+
+constexpr float EPS         = 1e-6f;
+constexpr float ROPE_THETA  = 10000000.0f;
+}  // namespace q35
+
+// CUDA and ROCm share ggml's CUDA backend interface. Tensor-parallel caches
+// use a meta backend, so inspect every rank-local backend before enabling ops
+// that have no CPU/Metal/Vulkan implementation.
+static bool supports_qwen35_fused_kernels(ggml_backend_t backend) {
+    if (ggml_backend_is_cuda(backend)) return true;
+    if (!ggml_backend_is_meta(backend)) return false;
+
+    const size_t n_backends = ggml_backend_meta_n_backends(backend);
+    if (n_backends == 0) return false;
+    for (size_t i = 0; i < n_backends; ++i) {
+        if (!ggml_backend_is_cuda(
+                ggml_backend_meta_simple_backend(backend, i))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ─── TargetCache allocation ─────────────────────────────────────────
+
+bool create_target_cache(const TargetWeights & w,
+                         int max_ctx,
+                         int max_verify_tokens,
+                         ggml_backend_t backend,
+                         TargetCache & out,
+                         bool prefill_only,
+                         int ctx_alloc,
+                         bool paged_attention,
+                         int n_seq_slots,
+                         bool concurrent_tree,
+                         ggml_type cache_type_k, ggml_type cache_type_v) {
+    return create_target_cache_partial(w, max_ctx, max_verify_tokens, backend,
+                                       out, prefill_only,
+                                       0, w.n_layer, true, ctx_alloc,
+                                       /*f32_ssm_intermediates=*/false,
+                                       paged_attention, n_seq_slots,
+                                       concurrent_tree, cache_type_k, cache_type_v);
+}
+
+// concurrent_fixed_cache_bytes() in qwen35_backend.cpp mirrors this
+// function's non-pool allocations to size the auto KV pool — keep the two
+// in sync when adding or resizing cache tensors here.
+bool create_target_cache_partial(const TargetWeights & w,
+                                 int max_ctx,
+                                 int max_verify_tokens,
+                                 ggml_backend_t backend,
+                                 TargetCache & out,
+                                 bool prefill_only,
+                                 int layer_begin,
+                                 int layer_end,
+                                 bool allocate_target_feat,
+                                 int ctx_alloc,
+                                 bool f32_ssm_intermediates,
+                                 bool paged_attention,
+                                 int n_seq_slots,
+                                 bool concurrent_tree,
+                         ggml_type cache_type_k, ggml_type cache_type_v) {
+    if (layer_begin < 0) layer_begin = 0;
+    if (layer_end < 0 || layer_end > w.n_layer) layer_end = w.n_layer;
+    if (layer_begin > layer_end) {
+        set_last_error("invalid target cache layer range");
+        return false;
+    }
+    if (n_seq_slots < 1) n_seq_slots = 1;
+    if (n_seq_slots > 1 && !paged_attention) {
+        set_last_error("multi-slot target cache requires paged attention");
+        return false;
+    }
+    if (concurrent_tree && (!paged_attention || n_seq_slots <= 1)) {
+        set_last_error(
+            "concurrent tree cache requires paged multi-slot serving");
+        return false;
+    }
+    out.backend = backend;
+    out.max_ctx = max_ctx;
+    out.cur_pos = 0;
+    out.n_seq_slots = n_seq_slots;
+    if (max_verify_tokens <= 0) {
+        max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
+    }
+
+    const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
+    const int n_delta     = w.n_layer - n_full_attn;               // 48
+    const int head_dim    = w.n_embd_head_k;
+    const int head_v_dim  = w.ssm_d_inner / w.ssm_dt_rank;
+    const int conv_ch     = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
+
+    out.attn_k.assign(n_full_attn, nullptr);
+    out.attn_v.assign(n_full_attn, nullptr);
+    out.ssm_state.assign(n_delta, nullptr);
+    out.conv_state.assign(n_delta, nullptr);
+    out.ssm_state_snap.assign(n_delta, nullptr);
+    out.conv_state_snap.assign(n_delta, nullptr);
+    out.ssm_intermediate.assign(n_delta, nullptr);
+    out.conv_input_cache.assign(n_delta, nullptr);
+
+    // KV cache element types (resolved from env; aborts on unsupported pair).
+    ggml_type kv_k_type = GGML_TYPE_Q8_0;
+    ggml_type kv_v_type = GGML_TYPE_Q8_0;
+    dflash::resolve_kv_types(kv_k_type, kv_v_type, cache_type_k, cache_type_v);
+    out.kv_k_type = kv_k_type;
+    out.kv_v_type = kv_v_type;
+
+    // Graph-level FWHT K-rotation (TurboQuant-style outlier spreading with
+    // standard quant types that keep fast FA kernel paths on all arches).
+    // The rotation costs two extra launches per attention layer. Decision
+    // logic lives in common/kv_rotation.h and is shared with the disk
+    // prefix cache identity salt: a cache written under one rotation basis
+    // must never be adopted by a session using the other. Ling's latent MLA
+    // cache uses unequal K/V widths, so it cannot use the qwen FWHT path.
+    out.kv_k_rotated =
+        !w.is_bailingmoe3 &&
+        dflash_kv_k_rotation_enabled(ggml_type_name(kv_k_type));
+
+    const bool needs_256_stride = w.is_bailingmoe3 ||
+        kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0;
+    // kvflash mode: attention tensors are allocated at the (smaller)
+    // physical pool capacity; logical positions are mapped to pool slots
+    // by KvFlashPager. The 256-stride rounding applies to whichever capacity
+    // is in effect.
+    // KVFlash may shrink the physical pool. Only an explicitly paged caller
+    // may grow it to the next whole block, and it must size the pool to
+    // exactly that: silent drift here would break block alignment.
+    const bool bounded_pool = ctx_alloc > 0 && ctx_alloc < max_ctx;
+    // Multi-slot caches share one physical pool across sequences: ctx_alloc
+    // is the caller-computed pool capacity (plus the dead-slot scratch block)
+    // and may exceed one sequence's max_ctx.
+    const bool multi_slot = n_seq_slots > 1;
+    const bool paged_padding = paged_attention && ctx_alloc > 0;
+    if (paged_attention && !multi_slot) {
+        GGML_ASSERT(ctx_alloc == paged_token_capacity(max_ctx));
+    }
+    const int ctx_phys =
+        (bounded_pool || paged_padding) ? ctx_alloc : max_ctx;
+    const int max_ctx_alloc = needs_256_stride
+        ? ((ctx_phys + 255) / 256) * 256
+        : ctx_phys;
+
+    // ── Base context: KV cache + SSM/conv state + target_feat ────────
+    {
+        const int base_tensors = 2 * n_full_attn + 2 * n_delta + 2;
+        ggml_init_params ip{};
+        ip.mem_size   = (size_t)(base_tensors + 16) * ggml_tensor_overhead();
+        ip.mem_buffer = nullptr;
+        ip.no_alloc   = true;
+        out.base_ctx = ggml_init(ip);
+        if (!out.base_ctx) { set_last_error("base cache ggml_init failed"); return false; }
+
+        int fa_idx = 0, dn_idx = 0;
+        for (int il = 0; il < w.n_layer; il++) {
+            const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
+            const bool owns_layer = il >= layer_begin && il < layer_end;
+            if (is_attn) {
+                if (!owns_layer) { fa_idx++; continue; }
+                // [head_dim, max_ctx_alloc, n_head_kv]
+                ggml_tensor * K = ggml_new_tensor_3d(out.base_ctx, kv_k_type,
+                                                     head_dim, max_ctx_alloc, w.n_head_kv);
+                const int v_head_dim = w.is_bailingmoe3
+                    ? w.n_embd_head_v : head_dim;
+                ggml_tensor * V = ggml_new_tensor_3d(
+                    out.base_ctx, kv_v_type, v_head_dim,
+                    max_ctx_alloc, w.n_head_kv);
+                char name[64];
+                std::snprintf(name, sizeof(name), "cache_k_%d", il);
+                ggml_set_name(K, name);
+                std::snprintf(name, sizeof(name), "cache_v_%d", il);
+                ggml_set_name(V, name);
+                out.attn_k[fa_idx] = K;
+                out.attn_v[fa_idx] = V;
+                fa_idx++;
+            } else {
+                if (!owns_layer) { dn_idx++; continue; }
+                // ssm_state: [head_v_dim, head_v_dim, num_v_heads, n_seq_slots]
+                // (identical layout to the historical 3D tensor when slots=1)
+                ggml_tensor * S = ggml_new_tensor_4d(out.base_ctx, GGML_TYPE_F32,
+                                                     head_v_dim, head_v_dim, w.ssm_dt_rank,
+                                                     n_seq_slots);
+                // conv_state: [kernel-1, conv_channels, n_seq_slots]
+                ggml_tensor * C = ggml_new_tensor_3d(out.base_ctx, GGML_TYPE_F32,
+                                                     w.ssm_d_conv - 1, conv_ch,
+                                                     n_seq_slots);
+                char name[64];
+                std::snprintf(name, sizeof(name), "ssm_state_%d", il);  ggml_set_name(S, name);
+                std::snprintf(name, sizeof(name), "conv_state_%d", il); ggml_set_name(C, name);
+                out.ssm_state[dn_idx]  = S;
+                out.conv_state[dn_idx] = C;
+                dn_idx++;
+            }
+        }
+
+        constexpr int TARGET_FEAT_CAP_DEFAULT = 4096;
+        out.target_feat_cap = std::min(max_ctx, TARGET_FEAT_CAP_DEFAULT);
+        if (allocate_target_feat) {
+            const int fc_in = w.n_capture_layers * w.n_embd;
+            // Concurrent slots own disjoint feature rings. The final row is
+            // dead scratch for padded bucket rows because set_rows does not
+            // accept negative destination indices.
+            const int feat_rows = concurrent_tree
+                ? out.target_feat_cap * n_seq_slots + 1
+                : out.target_feat_cap;
+            out.target_feat = ggml_new_tensor_2d(
+                out.base_ctx, GGML_TYPE_BF16, fc_in, feat_rows);
+            ggml_set_name(out.target_feat, "target_feat");
+        } else {
+            out.target_feat = nullptr;
+        }
+
+        // KVFlash target-QK query capture (~393 KB at 256*24*16 f32):
+        // always allocated; written only when QwenGraphInputs::q_capture.
+        out.q_cap = ggml_new_tensor_3d(out.base_ctx, GGML_TYPE_F32,
+                                       head_dim, w.n_head, n_full_attn);
+        ggml_set_name(out.q_cap, "q_cap");
+
+        // Paged-attention metadata is persistent like the K/V pool itself so
+        // decode steps can update it append-only; a gallocr graph input would
+        // need every live entry re-uploaded before every compute because its
+        // buffer region may be recycled between attention consumers.
+        if (paged_attention) {
+            out.paged_block_table = ggml_new_tensor_2d(
+                out.base_ctx, GGML_TYPE_I32, paged_block_count(max_ctx),
+                n_seq_slots);
+            ggml_set_name(out.paged_block_table, "paged_block_table");
+            out.paged_kv_seq_lens =
+                ggml_new_tensor_1d(out.base_ctx, GGML_TYPE_I32, n_seq_slots);
+            ggml_set_name(out.paged_kv_seq_lens, "paged_kv_seq_lens");
+        } else {
+            out.paged_block_table = nullptr;
+            out.paged_kv_seq_lens = nullptr;
+        }
+
+        out.base_buf = ggml_backend_alloc_ctx_tensors(out.base_ctx, backend);
+        if (!out.base_buf) {
+            set_last_error("ggml_backend_alloc_ctx_tensors failed for base cache");
+            ggml_free(out.base_ctx);
+            out.base_ctx = nullptr;
+            return false;
+        }
+    }
+
+    // ── Rollback context: snapshots + intermediates ───────────────────
+    // Multi-slot caches skip these entirely. Fixed chain verification keeps
+    // speculative recurrent transitions in graph scratch and promotes only
+    // accepted prefixes through the compact GPU replay log.
+    if (!prefill_only && !multi_slot) {
+        const int rb_tensors = 4 * n_delta;
+        ggml_init_params ip{};
+        ip.mem_size   = (size_t)(rb_tensors + 16) * ggml_tensor_overhead();
+        ip.mem_buffer = nullptr;
+        ip.no_alloc   = true;
+        out.rollback_ctx = ggml_init(ip);
+        if (!out.rollback_ctx) { set_last_error("rollback cache ggml_init failed"); return false; }
+
+        int dn_idx = 0;
+        for (int il = 0; il < w.n_layer; il++) {
+            if (((il + 1) % w.full_attention_interval) != 0) {
+                const bool owns_layer = il >= layer_begin && il < layer_end;
+                if (!owns_layer) { dn_idx++; continue; }
+                ggml_tensor * Sn = ggml_new_tensor_3d(out.rollback_ctx, GGML_TYPE_F32,
+                                                       head_v_dim, head_v_dim, w.ssm_dt_rank);
+                ggml_tensor * Cn = ggml_new_tensor_2d(out.rollback_ctx, GGML_TYPE_F32,
+                                                       w.ssm_d_conv - 1, conv_ch);
+                // I0 domain: ne[3] is the root-inclusive flat verify-token
+                // domain. Tree capture writes t=0 synthetic root through the
+                // final/padded flat slot directly into slot t.
+                const ggml_type ssm_intermediate_type = f32_ssm_intermediates
+                    ? GGML_TYPE_F32 : GGML_TYPE_Q8_0;
+                ggml_tensor * Si = ggml_new_tensor_4d(out.rollback_ctx, ssm_intermediate_type,
+                                                       head_v_dim, head_v_dim,
+                                                       w.ssm_dt_rank, max_verify_tokens);
+                // I0 domain: ne[0] is [K_conv-1 prefix rows |
+                // root-inclusive verify rows].
+                ggml_tensor * Ci = ggml_new_tensor_3d(out.rollback_ctx, GGML_TYPE_F32,
+                                                       (w.ssm_d_conv - 1) + max_verify_tokens,
+                                                       conv_ch, 1);
+                char name[64];
+                std::snprintf(name, sizeof(name), "ssm_state_snap_%d", il);  ggml_set_name(Sn, name);
+                std::snprintf(name, sizeof(name), "conv_state_snap_%d", il); ggml_set_name(Cn, name);
+                std::snprintf(name, sizeof(name), "ssm_intermediate_%d", il); ggml_set_name(Si, name);
+                std::snprintf(name, sizeof(name), "conv_input_cache_%d", il); ggml_set_name(Ci, name);
+                out.ssm_state_snap[dn_idx]  = Sn;
+                out.conv_state_snap[dn_idx] = Cn;
+                out.ssm_intermediate[dn_idx] = Si;
+                out.conv_input_cache[dn_idx] = Ci;
+                dn_idx++;
+            }
+        }
+
+        out.rollback_buf = ggml_backend_alloc_ctx_tensors(out.rollback_ctx, backend);
+        if (std::getenv("DFLASH_SPLIT_CHAIN_ROLLBACK_DIAG")) {
+            int owned_delta_layers = 0;
+            for (int il = 0; il < w.n_layer; ++il) {
+                if (((il + 1) % w.full_attention_interval) != 0 && il >= layer_begin && il < layer_end) {
+                    owned_delta_layers++;
+                }
+            }
+            const size_t elems_per_slot_per_layer = (size_t)head_v_dim * (size_t)head_v_dim * (size_t)w.ssm_dt_rank;
+            const size_t f32_bytes_per_slot_per_layer = elems_per_slot_per_layer * sizeof(float);
+            const size_t q8_bytes_per_slot_per_layer = ((elems_per_slot_per_layer + 31) / 32) * 34;
+            const size_t f32_total = f32_bytes_per_slot_per_layer * (size_t)max_verify_tokens * (size_t)owned_delta_layers;
+            const size_t q8_total = q8_bytes_per_slot_per_layer * (size_t)max_verify_tokens * (size_t)owned_delta_layers;
+            std::fprintf(stderr,
+                "[target-split][chain-rollback] split_ssm_intermediate_dtype=%s split_ssm_intermediate_persist_dtype_dst=%s split_ssm_intermediate_persist_quantized=%d layer_begin=%d layer_end=%d owned_delta_layers=%d max_verify_tokens=%d split_ssm_intermediate_f32_bytes=%zu split_ssm_intermediate_incremental_bytes_over_q8=%zu\n",
+                f32_ssm_intermediates ? "F32" : "Q8_0",
+                f32_ssm_intermediates ? "F32" : "Q8_0",
+                f32_ssm_intermediates ? 0 : 1,
+                layer_begin, layer_end, owned_delta_layers, max_verify_tokens, f32_total,
+                f32_ssm_intermediates && f32_total > q8_total
+                    ? f32_total - q8_total : 0);
+        }
+        if (!out.rollback_buf) {
+            set_last_error("ggml_backend_alloc_ctx_tensors failed for rollback cache");
+            ggml_free(out.rollback_ctx);
+            out.rollback_ctx = nullptr;
+            return false;
+        }
+    }
+
+    // ── Zero-initialize all state tensors ─────────────────────────────
+    const bool meta_backend = ggml_backend_buft_is_meta(
+        ggml_backend_get_default_buffer_type(backend));
+    if (meta_backend) {
+        ggml_backend_buffer_clear(out.base_buf, 0);
+        if (out.rollback_buf) ggml_backend_buffer_clear(out.rollback_buf, 0);
+    } else {
+        std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
+        ggml_context * ctx_list[] = { out.base_ctx, out.rollback_ctx };
+        for (int ci = 0; ci < 2; ci++) {
+            ggml_context * c = ctx_list[ci];
+            if (!c) continue;
+            for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr;
+                 t = ggml_get_next_tensor(c, t)) {
+                size_t nb = ggml_nbytes(t);
+                size_t off = 0;
+                while (off < nb) {
+                    size_t chunk = std::min(nb - off, zeros.size());
+                    ggml_backend_tensor_set(t, zeros.data(), off, chunk);
+                    off += chunk;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+static void refresh_specla_state_ptrs(TargetCache & c) {
+    if (!c.specla_state_ptrs) return;
+    const int n_delta = (int)c.ssm_state.size();
+    if (c.specla_state_ptrs->ne[0] != n_delta) return;
+    std::vector<int64_t> ptrs((size_t)n_delta, 0);
+    for (int dn = 0; dn < n_delta; dn++) {
+        if (!c.ssm_state[dn]) return;
+        ptrs[(size_t)dn] = (int64_t)(intptr_t)c.ssm_state[dn]->data;
+    }
+    ggml_backend_tensor_set(c.specla_state_ptrs, ptrs.data(), 0,
+                            sizeof(int64_t) * ptrs.size());
+    if (c.specla_conv_state_ptrs &&
+        c.specla_conv_state_ptrs->ne[0] == n_delta &&
+        (int)c.conv_state.size() == n_delta) {
+        for (int dn = 0; dn < n_delta; ++dn) {
+            if (!c.conv_state[dn]) return;
+            ptrs[(size_t)dn] = (int64_t)(intptr_t)c.conv_state[dn]->data;
+        }
+        ggml_backend_tensor_set(c.specla_conv_state_ptrs, ptrs.data(), 0,
+                                sizeof(int64_t) * ptrs.size());
+    }
+    if (c.specla_factor_ptrs && c.specla_factor_ptrs->ne[0] == 8 &&
+        c.factor_k_all && c.factor_v_new_all && c.factor_g_ps_all &&
+        c.conv_factor_all && c.factor_k_all_alt &&
+        c.factor_v_new_all_alt && c.factor_g_ps_all_alt &&
+        c.conv_factor_all_alt) {
+        const int64_t factor_ptrs[8] = {
+            (int64_t)(intptr_t)c.factor_k_all->data,
+            (int64_t)(intptr_t)c.factor_v_new_all->data,
+            (int64_t)(intptr_t)c.factor_g_ps_all->data,
+            (int64_t)(intptr_t)c.conv_factor_all->data,
+            (int64_t)(intptr_t)c.factor_k_all_alt->data,
+            (int64_t)(intptr_t)c.factor_v_new_all_alt->data,
+            (int64_t)(intptr_t)c.factor_g_ps_all_alt->data,
+            (int64_t)(intptr_t)c.conv_factor_all_alt->data,
+        };
+        ggml_backend_tensor_set(c.specla_factor_ptrs, factor_ptrs, 0,
+                                sizeof(factor_ptrs));
+    }
+}
+
+void free_target_cache(TargetCache & c) {
+    if (c.base_buf)     { ggml_backend_buffer_free(c.base_buf);     c.base_buf     = nullptr; }
+    if (c.base_ctx)     { ggml_free(c.base_ctx);                   c.base_ctx     = nullptr; }
+    if (c.rollback_buf) { ggml_backend_buffer_free(c.rollback_buf); c.rollback_buf = nullptr; }
+    if (c.rollback_ctx) { ggml_free(c.rollback_ctx);               c.rollback_ctx = nullptr; }
+    c.attn_k.clear();
+    c.attn_v.clear();
+    c.ssm_state.clear();
+    c.conv_state.clear();
+    c.ssm_state_snap.clear();
+    c.conv_state_snap.clear();
+    c.ssm_intermediate.clear();
+    c.conv_input_cache.clear();
+    c.conv_input_cache_alt.clear();
+    c.factor_k.clear();
+    c.factor_v_new.clear();
+    c.factor_g_ps.clear();
+    c.factor_k_alt.clear();
+    c.factor_v_new_alt.clear();
+    c.factor_g_ps_alt.clear();
+    c.factor_k_all = nullptr;
+    c.factor_v_new_all = nullptr;
+    c.factor_g_ps_all = nullptr;
+    c.factor_k_all_alt = nullptr;
+    c.factor_v_new_all_alt = nullptr;
+    c.factor_g_ps_all_alt = nullptr;
+    c.conv_factor_all = nullptr;
+    c.conv_factor_all_alt = nullptr;
+    c.specla_idx = nullptr;
+    c.specla_state_ptrs = nullptr;
+    c.specla_conv_state_ptrs = nullptr;
+    c.specla_factor_ptrs = nullptr;
+    c.specla_pending_bank = 0;
+    c.specla_pending_count = 0;
+    c.target_feat = nullptr;
+    c.q_cap = nullptr;
+    c.cur_pos = 0;
+}
+
+void reset_target_cache(TargetCache & c) {
+    c.cur_pos = 0;
+    c.specla_pending_bank = 0;
+    c.specla_pending_count = 0;
+    if (c.backend && ggml_backend_buft_is_meta(
+            ggml_backend_get_default_buffer_type(c.backend))) {
+        if (c.base_buf) ggml_backend_buffer_clear(c.base_buf, 0);
+        if (c.rollback_buf) ggml_backend_buffer_clear(c.rollback_buf, 0);
+        refresh_specla_state_ptrs(c);
+        return;
+    }
+    std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
+    ggml_context * ctx_list[] = { c.base_ctx, c.rollback_ctx };
+    for (int ci = 0; ci < 2; ci++) {
+        ggml_context * ctx = ctx_list[ci];
+        if (!ctx) continue;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr;
+             t = ggml_get_next_tensor(ctx, t)) {
+            size_t nb = ggml_nbytes(t);
+            size_t off = 0;
+            while (off < nb) {
+                size_t chunk = std::min(nb - off, zeros.size());
+                ggml_backend_tensor_set(t, zeros.data(), off, chunk);
+                off += chunk;
+            }
+        }
+    }
+    // reset_target_cache clears the whole rollback buffer, including this
+    // persistent device pointer table. Re-upload it for daemon request 2+.
+    refresh_specla_state_ptrs(c);
+}
+
+void reset_recurrent_state(TargetCache & c) {
+    c.specla_pending_bank = 0;
+    c.specla_pending_count = 0;
+    // Device-side clear of the whole base buffer (KV + SSM + conv): with the
+    // step-invariant decode the FA span is 256-padded and mask-less, so stale
+    // K/V rows from the PREVIOUS request inside the padded tail would be
+    // attended with real scores. cudaMemset is ~0.2ms — cheaper than the old
+    // host-zero writes, and zeroing KV too is what the padded span requires.
+    if (c.base_buf) {
+        ggml_backend_buffer_clear(c.base_buf, 0);
+        return;
+    }
+    auto zero_tensors = [](const std::vector<ggml_tensor *> & tensors) {
+        std::vector<uint8_t> zeros;
+        for (ggml_tensor * t : tensors) {
+            if (!t) continue;
+            const size_t nb = ggml_nbytes(t);
+            if (zeros.size() < nb) zeros.resize(nb, 0);
+            ggml_backend_tensor_set(t, zeros.data(), 0, nb);
+        }
+    };
+    zero_tensors(c.ssm_state);
+    zero_tensors(c.conv_state);
+}
+
+void reset_recurrent_slot(TargetCache & c, int slot) {
+    if (slot < 0 || slot >= c.n_seq_slots) return;
+    auto clear_slot = [slot, n = c.n_seq_slots](ggml_tensor * t) {
+        if (!t) return;
+        // The slot axis is outermost, so slot s is one contiguous slab.
+        const size_t bytes = ggml_nbytes(t) / (size_t)n;
+        ggml_backend_tensor_memset(t, 0, (size_t)slot * bytes, bytes);
+    };
+    for (ggml_tensor * t : c.ssm_state)  clear_slot(t);
+    for (ggml_tensor * t : c.conv_state) clear_slot(t);
+}
+
+// Attach rollback tensors to an existing prefill cache without touching the
+// base tensors (KV, SSM, conv, target_feat) that prefill already populated.
+// No D2D copies — the base tensors stay right where the graph wrote them.
+// If rollback tensors are already present (e.g. daemon mode second request),
+// this is a no-op.
+bool migrate_prefill_cache(const TargetWeights & w,
+                           int max_ctx,
+                           int max_verify_tokens,
+                           ggml_backend_t backend,
+                           TargetCache & cache,
+                           bool enable_specla) {
+    // Already migrated (e.g. daemon mode second+ request after reset_target_cache).
+    if (cache.rollback_ctx) return true;
+
+    const int n_delta = (int)cache.ssm_state.size(); // 48
+    const int head_v_dim = w.ssm_d_inner / w.ssm_dt_rank;
+    const int conv_ch = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
+    if (max_verify_tokens <= 0) {
+        max_verify_tokens = DFLASH27B_DRAFT_BLOCK_SIZE;
+    }
+
+    cache.ssm_state_snap.assign(n_delta, nullptr);
+    cache.conv_state_snap.assign(n_delta, nullptr);
+    cache.ssm_intermediate.assign(n_delta, nullptr);
+    cache.conv_input_cache.assign(n_delta, nullptr);
+    cache.conv_input_cache_alt.assign(n_delta, nullptr);
+
+    // SpecLA replaces the dense per-token state checkpoints with compact
+    // per-token factor buffers (~(S_k+S_v+1)·H_v·max_q·4B per layer vs
+    // state_size·max_q per layer) — the paper's §5.1 memory trade.
+    const bool specla = enable_specla;
+    if (specla) {
+        cache.factor_k.assign(n_delta, nullptr);
+        cache.factor_v_new.assign(n_delta, nullptr);
+        cache.factor_g_ps.assign(n_delta, nullptr);
+        cache.factor_k_alt.assign(n_delta, nullptr);
+        cache.factor_v_new_alt.assign(n_delta, nullptr);
+        cache.factor_g_ps_alt.assign(n_delta, nullptr);
+    }
+
+    const int rb_tensors = (specla ? 12 : 4) * n_delta + (specla ? 1 : 0);
+    ggml_init_params ip{};
+    ip.mem_size   = (size_t)(rb_tensors + 16) * ggml_tensor_overhead();
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    cache.rollback_ctx = ggml_init(ip);
+    if (!cache.rollback_ctx) { set_last_error("rollback cache ggml_init failed"); return false; }
+
+    // F32 checkpoints are the default: the rollback-from-first-accepted-token
+    // path depends on them and is the tuned decode path. They cost VRAM
+    // (+1.11 GiB on Qwen3.8-27B at 128K), so DFLASH_SINGLE_CHAIN_CHECKPOINT_F32=0
+    // restores the F16 representation and its rollback threshold of 5.
+    const ChainRollbackPolicy rollback_policy = resolve_chain_rollback_policy();
+    const ggml_type checkpoint_type = rollback_policy.checkpoint_f32
+        ? GGML_TYPE_F32 : GGML_TYPE_F16;
+
+    const int head_k_dim = w.ssm_d_state;
+    if (specla) {
+        // Consolidated double-buffered factors. Token-major layout lets one
+        // compaction kernel gather an arbitrary accepted tree path.
+        cache.factor_k_all = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_F32,
+            head_k_dim, w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.factor_v_new_all = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_F32,
+            head_v_dim, w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.factor_g_ps_all = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
+            w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.factor_k_all_alt = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_F32,
+            head_k_dim, w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.factor_v_new_all_alt = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_F32,
+            head_v_dim, w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.factor_g_ps_all_alt = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
+            w.ssm_dt_rank, n_delta, max_verify_tokens);
+        cache.conv_factor_all = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
+            conv_ch, n_delta, max_verify_tokens);
+        cache.conv_factor_all_alt = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
+            conv_ch, n_delta, max_verify_tokens);
+        ggml_set_name(cache.factor_k_all,     "specla_factor_k_all");
+        ggml_set_name(cache.factor_v_new_all, "specla_factor_v_all");
+        ggml_set_name(cache.factor_g_ps_all,  "specla_factor_g_all");
+        ggml_set_name(cache.factor_k_all_alt,     "specla_factor_k_all_alt");
+        ggml_set_name(cache.factor_v_new_all_alt, "specla_factor_v_all_alt");
+        ggml_set_name(cache.factor_g_ps_all_alt,  "specla_factor_g_all_alt");
+        ggml_set_name(cache.conv_factor_all,      "specla_conv_factor_all");
+        ggml_set_name(cache.conv_factor_all_alt,  "specla_conv_factor_all_alt");
+        cache.specla_idx = ggml_new_tensor_1d(cache.rollback_ctx, GGML_TYPE_I32,
+                                              max_verify_tokens);
+        cache.specla_state_ptrs = ggml_new_tensor_1d(cache.rollback_ctx, GGML_TYPE_I64,
+                                                     n_delta);
+        cache.specla_conv_state_ptrs = ggml_new_tensor_1d(
+            cache.rollback_ctx, GGML_TYPE_I64, n_delta);
+        cache.specla_factor_ptrs = ggml_new_tensor_1d(
+            cache.rollback_ctx, GGML_TYPE_I64, 8);
+        ggml_set_name(cache.specla_idx,        "specla_idx");
+        ggml_set_name(cache.specla_state_ptrs, "specla_state_ptrs");
+        ggml_set_name(cache.specla_conv_state_ptrs, "specla_conv_state_ptrs");
+        ggml_set_name(cache.specla_factor_ptrs, "specla_factor_ptrs");
+    }
+    int dn_idx = 0;
+    for (int il = 0; il < w.n_layer; il++) {
+        if (((il + 1) % w.full_attention_interval) != 0) {
+            ggml_tensor * Sn = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
+                                                   head_v_dim, head_v_dim, w.ssm_dt_rank);
+            ggml_tensor * Cn = ggml_new_tensor_2d(cache.rollback_ctx, GGML_TYPE_F32,
+                                                   w.ssm_d_conv - 1, conv_ch);
+            ggml_tensor * Ci = specla ? nullptr
+                : ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,
+                                     (w.ssm_d_conv - 1) + max_verify_tokens,
+                                     conv_ch, 1);
+            ggml_tensor * Ci_alt = nullptr;
+            char name[64];
+            std::snprintf(name, sizeof(name), "ssm_state_snap_%d", il);  ggml_set_name(Sn, name);
+            std::snprintf(name, sizeof(name), "conv_state_snap_%d", il); ggml_set_name(Cn, name);
+            if (Ci) {
+                std::snprintf(name, sizeof(name), "conv_input_cache_%d", il);
+                ggml_set_name(Ci, name);
+            }
+            cache.ssm_state_snap[dn_idx]  = Sn;
+            cache.conv_state_snap[dn_idx] = Cn;
+            cache.conv_input_cache[dn_idx] = Ci;
+            cache.conv_input_cache_alt[dn_idx] = Ci_alt;
+            if (Ci_alt) {
+                std::snprintf(name, sizeof(name), "conv_input_cache_alt_%d", il);
+                ggml_set_name(Ci_alt, name);
+            }
+            if (!specla) {
+                ggml_tensor * Si = ggml_new_tensor_4d(cache.rollback_ctx, checkpoint_type,
+                                                       head_v_dim, head_v_dim,
+                                                       w.ssm_dt_rank, max_verify_tokens);
+                std::snprintf(name, sizeof(name), "ssm_intermediate_%d", il); ggml_set_name(Si, name);
+                cache.ssm_intermediate[dn_idx] = Si;
+            }
+            dn_idx++;
+        }
+    }
+
+    cache.rollback_buf = ggml_backend_alloc_ctx_tensors(cache.rollback_ctx, backend);
+    if (rollback_policy.diagnostics) {
+        size_t checkpoint_bytes = 0;
+        for (ggml_tensor * t : cache.ssm_intermediate) {
+            if (t) checkpoint_bytes += ggml_nbytes(t);
+        }
+        const ggml_type allocated_checkpoint_type = cache.ssm_intermediate.empty() || !cache.ssm_intermediate[0]
+            ? GGML_TYPE_COUNT : cache.ssm_intermediate[0]->type;
+        std::fprintf(stderr,
+            "[target-single][chain-rollback] checkpoint_dtype=%s delta_layers=%d max_verify_tokens=%d checkpoint_bytes=%zu\n",
+            allocated_checkpoint_type == GGML_TYPE_COUNT ? "missing" : ggml_type_name(allocated_checkpoint_type),
+            n_delta, max_verify_tokens, checkpoint_bytes);
+    }
+    if (!cache.rollback_buf) {
+        set_last_error("ggml_backend_alloc_ctx_tensors failed for rollback cache");
+        ggml_free(cache.rollback_ctx);
+        cache.rollback_ctx = nullptr;
+        return false;
+    }
+
+    // Zero-initialize rollback tensors. Meta buffers must be cleared per rank;
+    // fixed-size host chunks can cut through an axis-2 split row.
+    if (ggml_backend_buft_is_meta(ggml_backend_get_default_buffer_type(backend))) {
+        ggml_backend_buffer_clear(cache.rollback_buf, 0);
+    } else {
+        std::vector<uint8_t> zeros(1 * 1024 * 1024, 0);
+        for (ggml_tensor * t = ggml_get_first_tensor(cache.rollback_ctx); t != nullptr;
+             t = ggml_get_next_tensor(cache.rollback_ctx, t)) {
+            size_t nb = ggml_nbytes(t);
+            size_t off = 0;
+            while (off < nb) {
+                size_t chunk = std::min(nb - off, zeros.size());
+                ggml_backend_tensor_set(t, zeros.data(), off, chunk);
+                off += chunk;
+            }
+        }
+    }
+
+    // SpecLA: per-layer factor views into the consolidated buffers, created
+    // after allocation so they carry live data/buffer pointers. Shaped like
+    // stand-alone per-layer tensors ([.., max_q] with a cross-layer token
+    // stride) so the capture path treats them like any other cache tensor.
+    if (specla) {
+        ggml_tensor * Fk = cache.factor_k_all;
+        ggml_tensor * Fv = cache.factor_v_new_all;
+        ggml_tensor * Fg = cache.factor_g_ps_all;
+        ggml_tensor * Fk_alt = cache.factor_k_all_alt;
+        ggml_tensor * Fv_alt = cache.factor_v_new_all_alt;
+        ggml_tensor * Fg_alt = cache.factor_g_ps_all_alt;
+        for (int dn = 0; dn < n_delta; dn++) {
+            cache.factor_k[dn] = ggml_view_3d(cache.rollback_ctx, Fk,
+                Fk->ne[0], Fk->ne[1], max_verify_tokens,
+                Fk->nb[1], Fk->nb[3], (size_t)dn * Fk->nb[2]);
+            cache.factor_v_new[dn] = ggml_view_3d(cache.rollback_ctx, Fv,
+                Fv->ne[0], Fv->ne[1], max_verify_tokens,
+                Fv->nb[1], Fv->nb[3], (size_t)dn * Fv->nb[2]);
+            cache.factor_g_ps[dn] = ggml_view_2d(cache.rollback_ctx, Fg,
+                Fg->ne[0], max_verify_tokens,
+                Fg->nb[2], (size_t)dn * Fg->nb[1]);
+            cache.factor_k_alt[dn] = ggml_view_3d(cache.rollback_ctx, Fk_alt,
+                Fk_alt->ne[0], Fk_alt->ne[1], max_verify_tokens,
+                Fk_alt->nb[1], Fk_alt->nb[3], (size_t)dn * Fk_alt->nb[2]);
+            cache.factor_v_new_alt[dn] = ggml_view_3d(cache.rollback_ctx, Fv_alt,
+                Fv_alt->ne[0], Fv_alt->ne[1], max_verify_tokens,
+                Fv_alt->nb[1], Fv_alt->nb[3], (size_t)dn * Fv_alt->nb[2]);
+            cache.factor_g_ps_alt[dn] = ggml_view_2d(cache.rollback_ctx, Fg_alt,
+                Fg_alt->ne[0], max_verify_tokens,
+                Fg_alt->nb[2], (size_t)dn * Fg_alt->nb[1]);
+            cache.conv_input_cache[dn] = ggml_view_3d(cache.rollback_ctx,
+                cache.conv_factor_all, cache.conv_factor_all->ne[0],
+                max_verify_tokens, 1, cache.conv_factor_all->nb[2],
+                cache.conv_factor_all->nb[2]*max_verify_tokens,
+                (size_t)dn*cache.conv_factor_all->nb[1]);
+            cache.conv_input_cache_alt[dn] = ggml_view_3d(cache.rollback_ctx,
+                cache.conv_factor_all_alt, cache.conv_factor_all_alt->ne[0],
+                max_verify_tokens, 1, cache.conv_factor_all_alt->nb[2],
+                cache.conv_factor_all_alt->nb[2]*max_verify_tokens,
+                (size_t)dn*cache.conv_factor_all_alt->nb[1]);
+        }
+        // State addresses are stable for the cache's lifetime. The same helper
+        // is also called after reset_target_cache clears rollback scratch.
+        refresh_specla_state_ptrs(cache);
+    }
+
+    return true;
+}
+
+// SpecLA DeltaConstruct commit (docs/SPECLA.md): one small graph advancing all
+// delta-net layers' durable SSM states along the accepted path,
+//   S_A = exp(g⁺_A) S0 + Σ_{t∈path} exp(g⁺_A − g⁺_t) k_t ⊗ ṽ_t,
+// from the factor buffers the last verify captured. The verify graph never
+// wrote the speculative state back, so cache.ssm_state still holds S0 here.
+bool specla_commit_accepted(TargetCache & cache,
+                            ggml_backend_t backend,
+                            const int32_t * accepted_idx,
+                            int A) {
+    const int n_delta = (int)cache.factor_k.size();
+    if (n_delta == 0 || A <= 0 || !accepted_idx || !backend) return false;
+
+    // The just-run factorized verify wrote the bank opposite the one its
+    // capture setup treated as pending (the capture views point at
+    // factor_k_alt when specla_pending_bank == 0). This function is called
+    // BEFORE the host-side bank rotation, so commit that opposite bank;
+    // committing bank 0 unconditionally replays stale factors on the first
+    // verify.
+    const int selected_bank = 1 - cache.specla_pending_bank;
+    const bool alt = selected_bank != 0;
+    ggml_tensor * Fk = alt ? cache.factor_k_all_alt : cache.factor_k_all;
+    ggml_tensor * Fv = alt ? cache.factor_v_new_all_alt : cache.factor_v_new_all;
+    ggml_tensor * Fg = alt ? cache.factor_g_ps_all_alt : cache.factor_g_ps_all;
+    ggml_tensor * Fc = alt ? cache.conv_factor_all_alt : cache.conv_factor_all;
+    if (!Fk || !Fv || !Fg || !Fc || !cache.specla_conv_state_ptrs ||
+        !cache.specla_conv_state_ptrs->data) {
+        return false;
+    }
+
+    for (int i = 0; i < A; i++) {
+        if (accepted_idx[i] < 0 || accepted_idx[i] >= Fk->ne[3]) return false;
+        // The factorized fallback's convolution capture is in flat-token
+        // order. Tree factorized verify is built with an HLD schedule in
+        // production; fail closed rather than commit a scattered DFS path.
+        if (accepted_idx[i] != i) return false;
+    }
+
+    // Pre-validate the convolution commit targets before mutating SSM state.
+    // The selected consolidated bank is [channels, layers, tokens]. Commit
+    // shifts each durable K-1 window and appends raw inputs [0, A).
+    if (Fc->type != GGML_TYPE_F32 || !ggml_is_contiguous(Fc) ||
+        Fc->ne[1] != n_delta || A > Fc->ne[2]) {
+        return false;
+    }
+    int d_conv = 0;
+    for (int il = 0; il < n_delta; il++) {
+        ggml_tensor * dst = (il < (int)cache.conv_state.size())
+            ? cache.conv_state[il] : nullptr;
+        if (!dst || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            dst->ne[1] != Fc->ne[0]) {
+            return false;
+        }
+        const int layer_d_conv = (int)dst->ne[0] + 1;
+        if (layer_d_conv < 2 || (d_conv != 0 && d_conv != layer_d_conv)) {
+            return false;
+        }
+        d_conv = layer_d_conv;
+    }
+
+    const int64_t S_k = Fk->ne[0];
+    const int64_t H   = Fk->ne[1];
+    const int64_t S_v = Fv->ne[0];
+    const int64_t HL  = H * n_delta;
+
+    // Fast path: one fused kernel updates every layer's state in place.
+    // Escape hatch DFLASH_SPECLA_FUSED_COMMIT=0 falls back to the ggml-graph
+    // implementation below (also the fallback on any launch failure).
+    static const bool kFusedCommit = []() {
+        const char * v = std::getenv("DFLASH_SPECLA_FUSED_COMMIT");
+        return v == nullptr || v[0] != '0';
+    }();
+    bool ok = false;
+    if (kFusedCommit && cache.specla_idx && cache.specla_state_ptrs) {
+        ggml_backend_tensor_set(cache.specla_idx, accepted_idx, 0,
+                                sizeof(int32_t) * (size_t)A);
+        bool launched = false;
+        if (specla_commit_fused(
+                (float * const *)cache.specla_state_ptrs->data,
+                (const float *)Fk->data,
+                (const float *)Fv->data,
+                (const float *)Fg->data,
+                (const int32_t *)cache.specla_idx->data,
+                A, (int)S_k, (int)S_v, (int)H, n_delta,
+                /*stream=*/nullptr, &launched)) {
+            ok = true;
+        } else if (launched) {
+            std::fprintf(stderr,
+                "specla_commit_accepted: fused kernel execution failed\n");
+            return false;
+        } else {
+            std::fprintf(stderr,
+                "specla_commit_accepted: fused launch rejected; using graph path\n");
+        }
+    }
+
+    if (!ok) {
+        // Persistent metadata arena + allocator, reused across steps like the
+        // verify step graph — avoids per-commit gallocr churn.
+        static thread_local std::vector<uint8_t> s_arena;
+        static thread_local ggml_gallocr_t s_galloc = nullptr;
+        const size_t graph_nodes = (size_t)n_delta * 8 + 64;
+        ggml_init_params ip{};
+        ip.mem_size = graph_nodes * 4 * ggml_tensor_overhead() +
+                      ggml_graph_overhead_custom(graph_nodes, false);
+        if (s_arena.size() < ip.mem_size) s_arena.resize(ip.mem_size);
+        ip.mem_buffer = s_arena.data();
+        ip.no_alloc = true;
+        ggml_context * ctx = ggml_init(ip);
+        if (!ctx) return false;
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, graph_nodes, false);
+
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, A);
+        ggml_set_input(idx);
+
+        // Gather the accepted token slices across ALL layers at once (the token
+        // axis is outermost in the consolidated buffers).
+        ggml_tensor * k_sel = ggml_get_rows(ctx,
+            ggml_reshape_2d(ctx, Fk, S_k * HL, Fk->ne[3]), idx);           // [S_k*HL, A]
+        ggml_tensor * v_sel = ggml_get_rows(ctx,
+            ggml_reshape_2d(ctx, Fv, S_v * HL, Fv->ne[3]), idx);           // [S_v*HL, A]
+        ggml_tensor * g_sel = ggml_get_rows(ctx,
+            ggml_reshape_2d(ctx, Fg, HL, Fg->ne[2]), idx);                 // [HL, A]
+        k_sel = ggml_reshape_3d(ctx, k_sel, S_k, HL, A);
+        v_sel = ggml_reshape_3d(ctx, v_sel, S_v, HL, A);
+
+        // w[hl, t] = exp(g⁺_A − g⁺_t); the deepest accepted node is last.
+        ggml_tensor * gA = ggml_view_2d(ctx, g_sel, HL, 1, g_sel->nb[1],
+                                        (size_t)(A - 1) * g_sel->nb[1]);
+        ggml_tensor * w_dec = ggml_exp(ctx, ggml_neg(ctx, ggml_sub(ctx, g_sel, gA)));
+
+        // Σ_t (k_t · w_t) ⊗ ṽ_t for every (layer, head) in one batched matmul.
+        ggml_tensor * kg = ggml_mul(ctx, k_sel, ggml_reshape_3d(ctx, w_dec, 1, HL, A));
+        ggml_tensor * kg_t = ggml_cont(ctx, ggml_permute(ctx, kg,    1, 2, 0, 3)); // [A, S_k, HL]
+        ggml_tensor * v_t  = ggml_cont(ctx, ggml_permute(ctx, v_sel, 1, 2, 0, 3)); // [A, S_v, HL]
+        ggml_tensor * upd  = ggml_mul_mat(ctx, kg_t, v_t);                         // [S_k, S_v, HL]
+        ggml_tensor * gA_exp = ggml_exp(ctx, ggml_cont(ctx, gA));                  // [HL, 1]
+
+        // Per-layer tail: S ← exp(g⁺_A)·S + upd (states are separate tensors).
+        for (int il = 0; il < n_delta; il++) {
+            ggml_tensor * S = cache.ssm_state[il];
+            if (!S) { ggml_free(ctx); return false; }
+            ggml_tensor * upd_l = ggml_view_3d(ctx, upd, S_k, S_v, H,
+                upd->nb[1], upd->nb[2], (size_t)il * H * upd->nb[2]);
+            ggml_tensor * gA_l = ggml_reshape_3d(ctx,
+                ggml_cont(ctx, ggml_view_1d(ctx, gA_exp, H, (size_t)il * H * gA_exp->nb[0])),
+                1, 1, H);
+            ggml_tensor * s_new = ggml_add(ctx, ggml_mul(ctx, S, gA_l), upd_l);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, s_new, S));
+        }
+
+        if (!s_galloc) {
+            s_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        }
+        ok = s_galloc != nullptr && ggml_gallocr_alloc_graph(s_galloc, gf);
+        if (ok) {
+            ggml_backend_tensor_set(idx, accepted_idx, 0, sizeof(int32_t) * A);
+            ok = ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS;
+        }
+        ggml_free(ctx);
+        if (ok) ggml_backend_synchronize(backend);
+    }
+    if (!ok) return false;
+
+    // Apply the accepted raw convolution factors across all layers. The
+    // token-major kernel handles partial and full acceptance without needing
+    // a synthetic K-1 prefix in the factor bank.
+    if (!specla_commit_conv_raw_fused(
+            (float * const *)cache.specla_conv_state_ptrs->data,
+            (const float *)Fc->data, A, (int)Fc->ne[2], n_delta,
+            (int)Fc->ne[0], d_conv, /*stream=*/nullptr)) {
+        std::fprintf(stderr,
+            "specla_commit_accepted: raw conv factor commit failed\n");
+        return false;
+    }
+
+    // The selected bank has been consumed into durable state. Mark it as the
+    // pending role with nothing outstanding so the next verify writes the
+    // opposite bank and the final flush is a no-op.
+    cache.specla_pending_bank = selected_bank;
+    cache.specla_pending_count = 0;
+    return true;
+}
+
+// Snapshot/restore SSM+conv state for speculative rollback. Queue all device
+// copies on one backend stream, then synchronize once for the complete snapshot.
+static bool recurrent_snapshot_layout_valid(const TargetCache & c) {
+    const size_t n = c.ssm_state.size();
+    if (c.ssm_state_snap.size() != n || c.conv_state.size() != n ||
+        c.conv_state_snap.size() != n) {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        const bool owns_state = c.ssm_state[i] || c.ssm_state_snap[i] ||
+                                c.conv_state[i] || c.conv_state_snap[i];
+        if (!owns_state) continue;
+        if (!c.ssm_state[i] || !c.ssm_state_snap[i] ||
+            !c.conv_state[i] || !c.conv_state_snap[i] ||
+            c.ssm_state[i]->type != c.ssm_state_snap[i]->type ||
+            !ggml_are_same_shape(c.ssm_state[i], c.ssm_state_snap[i]) ||
+            !ggml_are_same_stride(c.ssm_state[i], c.ssm_state_snap[i]) ||
+            c.conv_state[i]->type != c.conv_state_snap[i]->type ||
+            !ggml_are_same_shape(c.conv_state[i], c.conv_state_snap[i]) ||
+            !ggml_are_same_stride(c.conv_state[i], c.conv_state_snap[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool snapshot_ssm_state(TargetCache & c, ggml_backend_t backend) {
+    if (!backend || !recurrent_snapshot_layout_valid(c)) return false;
+    for (size_t i = 0; i < c.ssm_state.size(); i++) {
+        if (!c.ssm_state[i]) continue;
+        ggml_backend_tensor_copy_async(
+            backend, backend, c.ssm_state[i], c.ssm_state_snap[i]);
+        ggml_backend_tensor_copy_async(
+            backend, backend, c.conv_state[i], c.conv_state_snap[i]);
+    }
+    ggml_backend_synchronize(backend);
+    return true;
+}
+
+bool restore_ssm_state(TargetCache & c, ggml_backend_t backend) {
+    if (!backend || !recurrent_snapshot_layout_valid(c)) return false;
+    for (size_t i = 0; i < c.ssm_state.size(); i++) {
+        if (!c.ssm_state[i]) continue;
+        ggml_backend_tensor_copy_async(
+            backend, backend, c.ssm_state_snap[i], c.ssm_state[i]);
+        ggml_backend_tensor_copy_async(
+            backend, backend, c.conv_state_snap[i], c.conv_state[i]);
+    }
+    ggml_backend_synchronize(backend);
+    return true;
+}
+
+// Allocate SSM/conv rollback snapshot tensors by mirroring the live recurrent
+// state tensors' shapes. The MoE hybrid spec-decode path sets up its DeltaNet
+// state in base_buf but never calls migrate_prefill_cache, so without this
+// snapshot_ssm_state/restore_ssm_state are silent no-ops (the _snap arrays are
+// empty/null) and rejected draft tokens leak permanently into the linear
+// recurrent state, collapsing generation. Idempotent: reuses an existing
+// rollback_ctx (from a prior request or migrate_prefill_cache).
+bool ensure_ssm_snapshot(TargetCache & c, ggml_backend_t backend) {
+    if (c.rollback_ctx) return true;
+    const size_t n = c.ssm_state.size();
+    if (n == 0) return true;
+    c.ssm_state_snap.assign(n, nullptr);
+    c.conv_state_snap.assign(n, nullptr);
+
+    size_t cnt = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (c.ssm_state[i]) cnt++;
+        if (i < c.conv_state.size() && c.conv_state[i]) cnt++;
+    }
+    if (cnt == 0) return true;
+
+    ggml_init_params ip{};
+    ip.mem_size   = (cnt + 8) * ggml_tensor_overhead();
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    c.rollback_ctx = ggml_init(ip);
+    if (!c.rollback_ctx) { set_last_error("ensure_ssm_snapshot ggml_init failed"); return false; }
+
+    for (size_t i = 0; i < n; i++) {
+        char name[64];
+        if (c.ssm_state[i]) {
+            ggml_tensor * t = c.ssm_state[i];
+            ggml_tensor * sn = ggml_new_tensor(c.rollback_ctx, t->type, ggml_n_dims(t), t->ne);
+            std::snprintf(name, sizeof(name), "ssm_state_snap_%zu", i);
+            ggml_set_name(sn, name);
+            c.ssm_state_snap[i] = sn;
+        }
+        if (i < c.conv_state.size() && c.conv_state[i]) {
+            ggml_tensor * t = c.conv_state[i];
+            ggml_tensor * cn = ggml_new_tensor(c.rollback_ctx, t->type, ggml_n_dims(t), t->ne);
+            std::snprintf(name, sizeof(name), "conv_state_snap_%zu", i);
+            ggml_set_name(cn, name);
+            c.conv_state_snap[i] = cn;
+        }
+    }
+
+    c.rollback_buf = ggml_backend_alloc_ctx_tensors(c.rollback_ctx, backend);
+    if (!c.rollback_buf) {
+        set_last_error("ensure_ssm_snapshot alloc_ctx_tensors failed");
+        // Null the snap pointers so a later snapshot/restore_ssm_state (which
+        // iterates ssm_state.size()) skips them instead of dereferencing
+        // tensors from the freed rollback_ctx.
+        for (auto & p : c.ssm_state_snap)  p = nullptr;
+        for (auto & p : c.conv_state_snap) p = nullptr;
+        ggml_free(c.rollback_ctx);
+        c.rollback_ctx = nullptr;
+        return false;
+    }
+    return true;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────
+
+static ggml_tensor * build_swiglu_ffn(ggml_context * ctx, ggml_tensor * cur,
+                                      const TargetLayer & L) {
+    ggml_tensor * gate = ggml_mul_mat(ctx, L.w_gate, cur);   // [inter, n_tokens]
+    ggml_tensor * up   = ggml_mul_mat(ctx, L.w_up, cur);
+    ggml_tensor * gu;
+    if (L.w_gate_s == 1.0f && L.w_up_s == 1.0f) {
+        // GLU node right after the two matmuls: the CUDA/HIP backend fuses
+        // mul_mat(gate) + mul_mat(up) + swiglu into a single vector kernel
+        // for single-token decode.
+        gu = ggml_swiglu_split(ctx, gate, up);
+    } else {
+        gate = ggml_silu(ctx, apply_scale2(ctx, gate, L.w_gate_s));
+        up   = apply_scale2(ctx, up, L.w_up_s);
+        gu   = ggml_mul(ctx, gate, up);
+    }
+    return apply_scale2(ctx, ggml_mul_mat(ctx, L.w_down, gu), L.w_down_s);                  // [hidden, n_tokens]
+}
+
+// Full-attention block (matches llama.cpp's build_layer_attn for qwen35)
+//
+// `cache_k` / `cache_v` are the persistent KV buffers for this layer
+// (shape [head_dim, max_ctx, n_head_kv] f16). We write the new K/V for
+// `n_tokens` new positions starting at `kv_start`, then run causal attention
+// over [0..kv_start + n_tokens).
+//
+// kv_write_rows: non-null selects the step-invariant ggml_set_rows KV write; null = legacy ggml_cpy.
+static ggml_tensor * build_full_attn_block(
+    ggml_context * ctx,
+    ggml_cgraph * gf,
+    const TargetWeights & w,
+    const TargetLayer & L,
+    ggml_tensor * cur,
+    ggml_tensor * positions,
+    const int * rope_sections,
+    ggml_tensor * cache_k,
+    ggml_tensor * cache_v,
+    ggml_tensor * attn_mask,
+    int kv_start,
+    int n_tokens,
+    ggml_type kv_k_type,
+    ggml_type kv_v_type,
+    bool kv_k_rotated = false,
+    int fa_window = 0,
+    ggml_tensor * q_tail_capture = nullptr,
+    int q_tail_start = 0,
+    ggml_tensor * kv_write_rows = nullptr,
+    ggml_tensor ** q_fa_out = nullptr,  // post-RoPE/post-rotation Q [head_dim, n_tokens, n_head]
+    ggml_tensor * paged_block_table = nullptr,
+    ggml_tensor * paged_kv_seq_lens = nullptr,
+    // Ragged paged read (concurrent prefill): per-row block-table column and
+    // inclusive logical position, both [n_tokens] i32. The kernel clamps
+    // each row's KV extent to position+1 — causality without a mask — so
+    // prefill chunk rows and decode rows read the pool through one call.
+    ggml_tensor * paged_query_seq_ids = nullptr,
+    ggml_tensor * paged_query_positions = nullptr,
+    // Batched paged decode: max kv_seq_len across live slots. Overrides the
+    // kv_start + n_tokens launch bound, which spans one sequence only.
+    int paged_max_kv_len = 0,
+    // Compact decode row -> physical block-table column. Negative ids are
+    // graph-bucket padding rows.
+    ggml_tensor * active_slot_ids = nullptr,
+    // Packed paged-tree verification. Query rows are flattened
+    // sequence-major; row mappings are supplied through
+    // paged_query_seq_ids, while parent/tree metadata describes each tree.
+    ggml_tensor * paged_tree_parent_ids = nullptr,
+    ggml_tensor * paged_tree_sizes = nullptr,
+    int tree_width = 0,
+    int tree_scratch_base = 0,
+    int tree_scratch_stride = 0,
+    int paged_logical_max_ctx = 0
+) {
+    const int head_dim = w.n_embd_head_k;
+    const int n_head = w.n_head;
+    const int n_head_kv = w.n_head_kv;
+    const int q_dim = head_dim * n_head;
+    // ── Q projection (packed Q || gate), shape [2*q_dim, n_tokens]
+    ggml_tensor * QG = apply_scale2(ctx, ggml_mul_mat(ctx, L.wq, cur), L.wq_s);
+    // Reshape to [head_dim*2, n_head, n_tokens] so we can view the Q and gate halves
+    QG = ggml_reshape_3d(ctx, QG, head_dim * 2, n_head, n_tokens);
+
+    // Q half: view at offset 0, stride head_dim*2
+    // Layout: [head_dim, n_head, n_tokens]
+    ggml_tensor * Q = ggml_view_3d(ctx, QG,
+        head_dim, n_head, n_tokens,
+        ggml_element_size(QG) * head_dim * 2,                 // nb1: stride over n_head
+        ggml_element_size(QG) * head_dim * 2 * n_head,   // nb2: stride over n_tokens
+        /*offset*/ 0);
+    Q = rms_norm_mul(ctx, Q, L.q_norm, w.rms_eps);
+
+    // Gate half: view at offset head_dim
+    ggml_tensor * gate = ggml_view_3d(ctx, QG,
+        head_dim, n_head, n_tokens,
+        ggml_element_size(QG) * head_dim * 2,
+        ggml_element_size(QG) * head_dim * 2 * n_head,
+        ggml_element_size(QG) * head_dim);
+    gate = ggml_cont_2d(ctx, gate, q_dim, n_tokens);  // [q_dim, n_tokens]
+
+    // ── K and V projections
+    ggml_tensor * Kcur = apply_scale2(ctx, ggml_mul_mat(ctx, L.wk, cur), L.wk_s);
+    ggml_tensor * Vcur = apply_scale2(ctx, ggml_mul_mat(ctx, L.wv, cur), L.wv_s);
+
+    Kcur = ggml_reshape_3d(ctx, Kcur, head_dim, n_head_kv, n_tokens);
+    Kcur = rms_norm_mul(ctx, Kcur, L.k_norm, w.rms_eps);
+    Vcur = ggml_reshape_3d(ctx, Vcur, head_dim, n_head_kv, n_tokens);
+
+    // ── M-RoPE (multi-axis rotary). n_rot = HEAD_DIM/4 * 4 ? Actually
+    //    ggml_rope_multi takes n_dims = the number of dims to rotate; for
+    //    qwen35 that's rope.dimension_count=64 (out of head_dim=256).
+    int n_rot = w.rope_dimension_count;
+    int sections[4];
+    for (int i = 0; i < 4; i++) sections[i] = rope_sections[i];
+
+    Q = ggml_rope_multi(ctx, Q, positions, /*freq_factors=*/nullptr,
+                        n_rot, sections, GGML_ROPE_TYPE_MROPE,
+                        w.rope_n_ctx_orig, w.rope_theta, w.rope_freq_scale,
+                        w.rope_ext_factor, w.rope_attn_factor,
+                        w.rope_beta_fast, w.rope_beta_slow);
+    Kcur = ggml_rope_multi(ctx, Kcur, positions, nullptr,
+                           n_rot, sections, GGML_ROPE_TYPE_MROPE,
+                           w.rope_n_ctx_orig, w.rope_theta, w.rope_freq_scale,
+                           w.rope_ext_factor, w.rope_attn_factor,
+                           w.rope_beta_fast, w.rope_beta_slow);
+
+    if (q_tail_capture) {
+        const int chunk_lo = kv_start;
+        const int chunk_hi = kv_start + n_tokens;
+        const int cap_n = (int) q_tail_capture->ne[2];
+        const int tail_lo = q_tail_start;
+        const int tail_hi = q_tail_start + cap_n;
+        const int ov_lo = std::max(chunk_lo, tail_lo);
+        const int ov_hi = std::min(chunk_hi, tail_hi);
+        if (ov_lo < ov_hi) {
+            const int local_lo = ov_lo - chunk_lo;
+            const int cap_lo = ov_lo - tail_lo;
+            const int n_cap = ov_hi - ov_lo;
+            ggml_tensor * q_src = ggml_view_3d(ctx, Q,
+                head_dim, n_head, n_cap,
+                Q->nb[1], Q->nb[2], (size_t)local_lo * Q->nb[2]);
+            q_src = ggml_cont(ctx, q_src);
+            q_src = ggml_reshape_1d(ctx, q_src, head_dim * n_head * n_cap);
+            ggml_tensor * q_dst = ggml_view_1d(ctx, q_tail_capture,
+                head_dim * n_head * n_cap,
+                (size_t)cap_lo * q_tail_capture->nb[2]);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, q_src, q_dst));
+        }
+    }
+
+    // ── Write K/V into the persistent cache at slot [kv_start..kv_start+n_tokens)
+    //
+    // cache_k is [head_dim, max_ctx, n_head_kv]. We want to copy Kcur
+    // [head_dim, n_head_kv, n_tokens] into cache_k[:, kv_start:kv_start+n_tokens, :].
+    ggml_tensor * Kcur_T = ggml_permute(ctx, Kcur, 0, 2, 1, 3);  // [head_dim, n_tokens, n_head_kv]
+    ggml_tensor * Vcur_T = ggml_permute(ctx, Vcur, 0, 2, 1, 3);  // [head_dim, n_tokens, n_head_kv]
+
+    // Graph-level FWHT rotation: rotate K before writing to standard-type cache.
+    if (kv_k_rotated) {
+        Kcur_T = ggml_turbo_wht(ctx, Kcur_T, 0);
+    }
+
+    const bool paged_tree = paged_tree_parent_ids || paged_tree_sizes;
+    GGML_ASSERT((paged_tree_parent_ids == nullptr) ==
+                (paged_tree_sizes == nullptr));
+    const bool ragged = paged_query_seq_ids != nullptr;
+    GGML_ASSERT(!ragged || (paged_block_table && kv_write_rows));
+    GGML_ASSERT(!ragged || paged_tree || paged_query_positions);
+    GGML_ASSERT(!paged_tree || (ragged && tree_width > 0));
+    if (kv_write_rows) {
+        // Step-invariant: the destination tensor stays fixed while the input
+        // indices carry contiguous, KVFlash, or paged physical rows.
+        // ggml_set_rows requires a contiguous source. Expanded before the
+        // attention node, so a ragged step's own chunk rows are already in
+        // the pool when its causal reads run.
+        ggml_tensor * Kcur_cont = ggml_is_contiguous(Kcur_T) ? Kcur_T : ggml_cont(ctx, Kcur_T);
+        ggml_tensor * Vcur_cont = ggml_is_contiguous(Vcur_T) ? Vcur_T : ggml_cont(ctx, Vcur_T);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, Kcur_cont, kv_write_rows));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, Vcur_cont, kv_write_rows));
+    } else {
+        // Legacy: kv_start as literal view offset (not step-invariant;
+        // prefill/verify/non-graph).
+        ggml_tensor * k_slot = ggml_view_3d(ctx, cache_k,
+            head_dim, n_tokens, n_head_kv,
+            cache_k->nb[1], cache_k->nb[2],
+            /*offset*/ cache_k->nb[1] * kv_start);
+        ggml_tensor * v_slot = ggml_view_3d(ctx, cache_v,
+            head_dim, n_tokens, n_head_kv,
+            cache_v->nb[1], cache_v->nb[2],
+            cache_v->nb[1] * kv_start);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, Kcur_T, k_slot));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, Vcur_T, v_slot));
+    }
+
+    // ── Flash attention over the valid slice
+    const int kv_len = kv_start + n_tokens;
+
+    // Stride-256 FA span when (a) TQ3_0 requires it, or (b) the step-invariant
+    // set_rows KV write is active (kv_write_rows): a fixed span within each
+    // 256-token window keeps node properties identical across decode steps so
+    // the ggml-cuda CUDA-graph cache can replay. Same numerics as the existing
+    // TQ3_0 path: the cache is zero-initialised, so padded rows contribute
+    // exp(-row_max) ~ 0 to the (mask-less) softmax denominator.
+    const bool  step_invariant = kv_write_rows != nullptr;
+    const int fattn_stride  = (kv_k_type == GGML_TYPE_TQ3_0 || kv_v_type == GGML_TYPE_TQ3_0 ||
+                               step_invariant) ? 256 : 1;
+    // Round a KV span up to the FA stride.
+    const auto padded_kv_len = [&](int len) {
+        return ((len + fattn_stride - 1) / fattn_stride) * fattn_stride;
+    };
+
+    ggml_tensor * Qperm = ggml_permute(ctx, Q, 0, 2, 1, 3);
+    // When K is rotated (TQ3_0 or explicit FWHT), Q needs forward rotation too.
+    const bool q_rotate   = (kv_k_type == GGML_TYPE_TQ3_0) || kv_k_rotated;
+    const bool out_rotate = (kv_v_type == GGML_TYPE_TQ3_0);
+    // A token-axis slice of Qperm, rotated/cont'd for the attention ops.
+    // turbo_wht handles strided input, so when rotating we skip the separate
+    // ggml_cont — the rotation kernel makes the output contiguous. Fused mode
+    // conts each segment on its own: a slice of one whole-batch cont would
+    // stay strided on the token axis.
+    auto q_segment = [&](int off, int len) {
+        ggml_tensor * q = (off == 0 && len == n_tokens)
+            ? Qperm
+            : ggml_view_3d(ctx, Qperm, head_dim, len, n_head,
+                           Qperm->nb[1], Qperm->nb[2],
+                           (size_t)off * Qperm->nb[1]);
+        return q_rotate ? ggml_turbo_wht(ctx, q, 0) : ggml_cont(ctx, q);
+    };
+
+    const float kq_scale = 1.0f / std::sqrt((float)head_dim);
+    auto paged_read = [&](ggml_tensor * q, int launch_kv_len,
+                          ggml_tensor * row_seq_ids,
+                          ggml_tensor * row_positions,
+                          bool dense_token_layout) {
+        // max_kv_seq_len sizes the logical partition grid. Paged serving can
+        // map that logical range onto a much smaller physical K/V pool, so
+        // cache_k->ne[1] is not a valid clamp.
+        // Bound against both sources of logical capacity instead, doing the
+        // 256-window rounding in i64 to avoid signed overflow at large
+        // configured contexts. Per-row kv_seq_lens remains the exact runtime
+        // bound, and the paged kernel bounds every resolved physical row.
+        GGML_ASSERT(paged_block_table && cache_k && cache_v);
+        const int64_t table_capacity =
+            (int64_t)paged_block_table->ne[0] * PAGED_BLOCK_SIZE;
+        const int64_t logical_capacity =
+            std::min<int64_t>(paged_logical_max_ctx, table_capacity);
+        GGML_ASSERT(logical_capacity > 0 && logical_capacity <= INT32_MAX);
+        const int64_t requested =
+            std::min<int64_t>(std::max<int64_t>(1, launch_kv_len),
+                              logical_capacity);
+        const int64_t padded = ((requested + 255) / 256) * 256;
+        const int launch_len =
+            (int)std::min<int64_t>(padded, logical_capacity);
+        ggml_tensor * out = paged_tree
+            ? ggml_paged_attn_ext_tree(
+                ctx, q, cache_k, cache_v, paged_block_table,
+                paged_kv_seq_lens, row_seq_ids, row_positions, kq_scale,
+                PAGED_BLOCK_SIZE, launch_len,
+                paged_tree_parent_ids, paged_tree_sizes,
+                tree_scratch_base, tree_scratch_stride)
+            : ggml_paged_attn_ext(
+                ctx, q, cache_k, cache_v, paged_block_table,
+                paged_kv_seq_lens, row_seq_ids, row_positions, kq_scale,
+                PAGED_BLOCK_SIZE, launch_len);
+        if (dense_token_layout) {
+            out = ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
+        }
+        return out;
+    };
+
+    ggml_tensor * attn = nullptr;
+    if (paged_tree) {
+        // ── Packed concurrent tree verify. Every query row selects its
+        // physical sequence/scratch slab. The paged kernel combines the
+        // committed block-table prefix with only this node's ancestor chain.
+        // A mixed graph uses causal positions for the compact AR prefix and
+        // -1 for the tree tail; a pure tree keeps positions absent.
+        ggml_tensor * Qfa = q_segment(0, n_tokens);
+        if (q_fa_out) *q_fa_out = Qfa;
+        const int launch_kv_len = paged_max_kv_len > 0
+            ? paged_max_kv_len : kv_start + n_tokens;
+        attn = paged_read(Qfa, launch_kv_len,
+                          paged_query_seq_ids, paged_query_positions,
+                          /*dense_token_layout=*/n_tokens > 1);
+    } else if (ragged) {
+        // ── Ragged concurrent step: prefill chunk rows and decode rows all
+        // read the pool through one call, each row clamped to its own
+        // inclusive position. This step's chunk rows are visible to their
+        // own causal reads because the set_rows pool write above precedes
+        // attention in the graph; cross-sequence isolation is structural
+        // (each row's seq id selects its own block-table column).
+        ggml_tensor * Qfa = q_segment(0, n_tokens);
+        if (q_fa_out) *q_fa_out = Qfa;
+        const int launch_kv_len = paged_max_kv_len > 0 ? paged_max_kv_len
+                                                       : kv_start + n_tokens;
+        attn = paged_read(Qfa, launch_kv_len,
+                          paged_query_seq_ids, paged_query_positions,
+                          /*dense_token_layout=*/n_tokens > 1);
+    } else if (paged_block_table) {
+        ggml_tensor * Qfa = q_segment(0, n_tokens);
+        // Post-rotation Q matches the basis of the K rows in the cache, so a
+        // cosine between this Q and pooled cache keys equals the unrotated
+        // cosine (orthogonal transform).
+        if (q_fa_out) *q_fa_out = Qfa;
+        GGML_ASSERT(paged_kv_seq_lens);
+        // The launch bound lands in op_params, and the ggml-cuda graph cache
+        // memcmps the whole ggml_tensor: a live kv_len here would differ on
+        // every decode step and force a re-capture per token. Pad it on the
+        // same 256-token stride the dense path uses for win_len_padded, so the
+        // paged node's properties are stable within each window. Exact
+        // per-sequence extents still come from kv_seq_lens on device; a larger
+        // bound only over-sizes the partition grid, and partitions past the
+        // real length exit with a zero-weight sentinel.
+        // Batched decode: kv_len (kv_start + n_tokens) describes one sequence;
+        // the launch bound must cover the longest live slot instead. Bounded
+        // paged pools may be physically smaller than this logical span.
+        const int launch_kv_len = paged_max_kv_len > 0 ? paged_max_kv_len : kv_len;
+        attn = paged_read(
+            Qfa, launch_kv_len, active_slot_ids, /*row_positions=*/nullptr,
+            /*dense_token_layout=*/active_slot_ids && n_tokens > 1);
+        if (!active_slot_ids) {
+            // The only non-mapped paged caller is classic single-token AR.
+            GGML_ASSERT(n_tokens == 1);
+        }
+    } else {
+        // fa_window > 0: attend only to the last fa_window positions (cuts FA
+        // cost during spec-decode verify at long contexts). Paged attention
+        // ignores the window entirely — it walks the block table for the whole
+        // sequence — which is why build_target_step rejects the combination.
+        const int win_start = (fa_window > 0 && kv_start > fa_window)
+                                  ? (kv_start - fa_window) : 0;
+        const int win_len = kv_len - win_start;
+        int win_len_padded = padded_kv_len(win_len);
+        if (step_invariant) {
+            // Never view past the read tensor (its rows may not be 256-aligned).
+            win_len_padded = std::min(win_len_padded, (int)cache_k->ne[1]);
+        }
+        // kvflash: KV lives at pool SLOTS, and the caller's mask is built in
+        // slot space over the whole pool. Slot indices are not bounded by the
+        // logical context length, so a view sized from kv_start can end below
+        // slots the mask still marks visible: those rows fall outside the
+        // view and the softmax row degenerates, which surfaces as an argmax
+        // of -1 for every verify row past the first. Span the whole pool
+        // instead; the mask, sized from that same pool, is what decides which
+        // slots are readable. Detect the mode by the pair only slot-mapped
+        // verify sets: a set_rows KV write together with an explicit mask.
+        if (kv_write_rows != nullptr && attn_mask != nullptr) {
+            win_len_padded = (int)cache_k->ne[1];
+        }
+
+        // K and V from cache: a windowed view starting at win_start.
+        ggml_tensor * Kfa = ggml_view_3d(ctx, cache_k,
+            head_dim, win_len_padded, n_head_kv,
+            cache_k->nb[1], cache_k->nb[2], cache_k->nb[1] * win_start);
+        ggml_tensor * Vfa = ggml_view_3d(ctx, cache_v,
+            head_dim, win_len_padded, n_head_kv,
+            cache_v->nb[1], cache_v->nb[2], cache_v->nb[1] * win_start);
+
+        ggml_tensor * Qfa = q_segment(0, n_tokens);
+        if (q_fa_out) *q_fa_out = Qfa;
+        // A single query needs no causal mask. Multi-token callers supply one.
+        attn = ggml_flash_attn_ext(ctx, Qfa, Kfa, Vfa, attn_mask,
+                                   kq_scale, 0.0f, 0.0f);
+    }
+    // Dense output is [D,Hq,n_tokens]; paged output is [D,n_seq,Hq]. They are
+    // layout-equivalent when n_tokens/n_seq is one (classic paged decode);
+    // batched paged decode permutes back to the dense layout above.
+
+    // Un-rotate the FA output from FWHT-rotated V space (only when V is TQ3).
+    if (out_rotate) {
+        attn = ggml_turbo_wht(ctx, attn, 1);
+    }
+
+    attn = ggml_reshape_2d(ctx, attn, q_dim, n_tokens);
+
+    // ── Apply the sigmoid gate from the packed Q
+    ggml_tensor * gate_sig = ggml_sigmoid(ctx, gate);
+    attn = ggml_mul(ctx, attn, gate_sig);
+
+    // ── Output projection
+    attn = apply_scale2(ctx, ggml_mul_mat(ctx, L.wo, attn), L.wo_s);
+    return attn;
+}
+
+// Gated DeltaNet block using the fused ggml_gated_delta_net primitive.
+//
+// Matches the semantics of llama.cpp's build_layer_attn_linear + build_delta_net_fused.
+// Updates cache->conv_state and cache->ssm_state in place.
+//
+// When `cap` is non-null, the function populates `cap->ssm_intermediate_states`
+// with a view into the gated_delta_net result's per-step recurrent states and
+// `cap->conv_input` with the concatenated conv input (old state + new tokens),
+// both of which are marked as graph outputs so the caller can rollback SSM and
+// conv state to any intermediate step commit_n-1 without a replay forward pass.
+static ggml_tensor * build_delta_net_block(
+    ggml_context * ctx,
+    ggml_cgraph * gf,
+    const TargetWeights & w,
+    const TargetLayer & L,
+    ggml_tensor * cur,            // [hidden, n_tokens]
+    ggml_tensor * conv_state,     // [kernel-1, conv_channels, n_seqs] persistent (or slot view)
+    ggml_tensor * ssm_state,      // [head_v_dim, head_v_dim, num_v_heads, n_seqs] persistent (or slot view)
+    int n_tokens,
+    DeltaNetCapture * cap,        // optional: populated on capture_delta_intermediate
+    ggml_tensor * parent_ids,     // optional [n_tokens] i32; tree mode when non-null
+    bool skip_gdn_intermediate,
+    bool fused_kernel_backend,    // CUDA/HIP backend implements fused conv/raw gates
+    // Supported shapes are one sequence with any number of timesteps
+    // (prefill/verify), or compact decode with one timestep per mapped row.
+    int n_seqs = 1,
+    // Concurrent prefill: leading token-axis segments, one per prefilling
+    // prompt (see QwenPrefillSegment). Each runs an independent S=1
+    // recurrence on its slot's own slab (views built here from the full
+    // state tensors); when active_slot_ids is present, the trailing n_seqs
+    // tokens are the batched one-token-per-slot decode against the full
+    // state tensors. The projections and the output projection stay
+    // whole-batch (each weight read once); only the conv/recurrence core
+    // splits into already-proven per-segment configurations.
+    const QwenPrefillSegment * prefill_segments = nullptr,
+    int n_prefill_segments = 0,
+    ggml_tensor * active_slot_ids = nullptr,
+    ggml_tensor * state_slot_ids = nullptr,
+    int mapped_ar_seqs = 0,
+    bool allow_inplace_state = false,
+    // SpecLA topology masks (all three non-null together): route the
+    // recurrence through the topology-masked factor-capture verify.
+    // parent_ids then only steers the tree conv; the recurrence gets its
+    // topology from the masks. See docs/SPECLA.md.
+    ggml_tensor * specla_m_strict = nullptr,
+    ggml_tensor * specla_m_incl   = nullptr,
+    ggml_tensor * specla_m_eye    = nullptr,
+    ggml_tensor * specla_hld      = nullptr,
+    int specla_n_boundaries       = 0,
+    int specla_n_chains           = 0,
+    int specla_n_waves            = 0,
+    int specla_max_parallel_chains = 0
+) {
+    const int head_k_dim   = w.ssm_d_state;
+    const int num_k_heads  = w.ssm_n_group;
+    const int num_v_heads  = w.ssm_dt_rank;
+    const int head_v_dim   = w.ssm_d_inner / w.ssm_dt_rank;
+    const int conv_channels = w.ssm_d_inner + 2 * w.ssm_n_group * w.ssm_d_state;
+    const bool ragged = n_prefill_segments > 0;
+    GGML_ASSERT(n_seqs >= 1);
+    GGML_ASSERT(n_prefill_segments == 0 || prefill_segments);
+    int prefill_total = 0;
+    for (int i = 0; i < n_prefill_segments; ++i) {
+        GGML_ASSERT(prefill_segments[i].token_offset == prefill_total &&
+                    prefill_segments[i].n_tokens > 0);
+        prefill_total += prefill_segments[i].n_tokens;
+    }
+    GGML_ASSERT((active_slot_ids == nullptr) == (state_slot_ids == nullptr));
+    const bool mapped_tree = active_slot_ids && parent_ids;
+    GGML_ASSERT(mapped_ar_seqs >= 0);
+    GGML_ASSERT(mapped_ar_seqs == 0 || mapped_tree);
+    GGML_ASSERT(!active_slot_ids || !cap ||
+                (!cap->ssm_intermediate_states && !cap->conv_input));
+    GGML_ASSERT(!active_slot_ids ||
+                (mapped_tree
+                     ? (!ragged && prefill_total == 0 &&
+                        n_tokens >= mapped_ar_seqs &&
+                        (n_tokens - mapped_ar_seqs) % n_seqs == 0 &&
+                        active_slot_ids->ne[0] ==
+                            mapped_ar_seqs + n_seqs &&
+                        state_slot_ids->ne[0] ==
+                            mapped_ar_seqs + n_seqs)
+                     : (mapped_ar_seqs == 0 &&
+                        prefill_total + n_seqs == n_tokens)));
+    if (!active_slot_ids) {
+        GGML_ASSERT(n_seqs == 1);
+        GGML_ASSERT(prefill_total == 0 || prefill_total == n_tokens);
+    }
+    GGML_ASSERT(!ragged || (!cap && !parent_ids));
+
+    // Row slices of stacked projections are strided for multi-token inputs.
+    // Materialize only the small beta/alpha slices; qkv keeps its explicit
+    // column stride and z is made contiguous at the final per-segment gate.
+    auto contig = [&](ggml_tensor * t) {
+        return ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
+    };
+    // Fully factorized SpecLA fallback: the current candidates do not mutate
+    // durable state. The HLD route below may materialize the *previously*
+    // accepted pending path while keeping current candidates speculative.
+    const bool use_specla_factorized = cap && cap->factor_k && cap->factor_v_new &&
+        cap->factor_g_ps && specla_m_strict && specla_m_incl && specla_m_eye;
+    const bool use_specla_hld = cap && cap->factor_ptrs &&
+        cap->factor_n_layers > 0 && cap->factor_layer >= 0 &&
+        cap->factor_layer < cap->factor_n_layers && specla_hld &&
+        specla_n_chains > 0 && specla_n_waves > 0 &&
+        specla_max_parallel_chains > 0;
+    GGML_ASSERT(!(use_specla_factorized || use_specla_hld) ||
+                (n_seqs == 1 && !ragged && !active_slot_ids));
+
+    // ── Whole-batch projections ─────────────────────────────────────
+    // qkv_mixed = wqkv @ cur           [10240, n_tokens]
+    // z         = wqkv_gate @ cur      [inner, n_tokens]
+    // One GEMV over the stacked (z | qkv) alias when the loader built it;
+    // qkv_2d is then a strided column view of the stacked result.
+    ggml_tensor * qkv_2d = nullptr;
+    ggml_tensor * z = nullptr;
+    const bool stacked_qkv_z = L.wqkv_z && L.wqkv_s == 1.0f && L.wqkv_gate_s == 1.0f;
+    if (stacked_qkv_z) {
+        const int64_t n_z = L.wqkv_gate->ne[1];
+        ggml_tensor * qkvz = ggml_mul_mat(ctx, L.wqkv_z, cur);   // [n_z + conv_channels, n_tokens]
+        const size_t e = ggml_element_size(qkvz);
+        z      = ggml_view_2d(ctx, qkvz, n_z, n_tokens, qkvz->nb[1], 0);
+        qkv_2d = ggml_view_2d(ctx, qkvz, conv_channels, n_tokens, qkvz->nb[1], (size_t)n_z * e);
+    } else {
+        qkv_2d = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv, cur), L.wqkv_s);
+        z      = apply_scale2(ctx, ggml_mul_mat(ctx, L.wqkv_gate, cur), L.wqkv_gate_s);
+    }
+
+    // beta  = ssm_beta @ cur           [dt_rank, n_tokens]
+    // alpha = ssm_alpha @ cur          [dt_rank, n_tokens]
+    // One GEMV over the stacked (beta | alpha) alias when available.
+    ggml_tensor * beta_2d = nullptr;
+    ggml_tensor * alpha_2d = nullptr;
+    ggml_tensor * ba = nullptr;
+    const bool stacked_ba = L.ssm_ba && L.ssm_beta_s == 1.0f && L.ssm_alpha_s == 1.0f;
+    if (stacked_ba) {
+        ba = ggml_mul_mat(ctx, L.ssm_ba, cur);     // [2 * dt_rank, n_tokens]
+        const size_t e = ggml_element_size(ba);
+        beta_2d = contig(ggml_view_2d(ctx, ba, num_v_heads, n_tokens, ba->nb[1], 0));
+        alpha_2d = contig(ggml_view_2d(ctx, ba, num_v_heads, n_tokens, ba->nb[1], (size_t)num_v_heads * e));
+    } else {
+        beta_2d = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_beta, cur), L.ssm_beta_s);
+        alpha_2d = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_alpha, cur), L.ssm_alpha_s);
+    }
+
+    // Fused kernels (single-sequence chain path only): the conv step and the
+    // gate prep are folded into the ssm_conv_step / gated_delta_net kernels
+    // instead of 6-8 tiny graph ops per layer. DFLASH_QWEN35_NO_FUSED_KERNELS=1
+    // keeps the op-by-op graph for A/B checks. The chunked delta-net path
+    // (opt-in) needs the materialized gates, so it is decided here too.
+    static const bool fused_kernels_env = std::getenv("DFLASH_QWEN35_NO_FUSED_KERNELS") == nullptr;
+    // Chunked delta-net (llama.cpp build_delta_net_chunking port, verified
+    // ~1e-6 vs the sequential kernel): re-expresses the recurrence as
+    // chunk-parallel matmuls. Prefill-shaped calls only; decode, verify
+    // (rollback capture), tree, ragged and SpecLA paths always keep the
+    // sequential fused kernel. OFF by default: on gfx1201 the sequential
+    // kernel wins at a 512-token ubatch (514 ms vs 667 ms per forward; the
+    // ~20k-node chunk graph costs more in launches than it saves in GDN
+    // serialization). DFLASH27B_CHUNKED=1 opts in for A/B on other
+    // hardware.
+    static const bool chunked_env_on = []() {
+        const char * s_env = std::getenv("DFLASH27B_CHUNKED");
+        return s_env && std::atoi(s_env) == 1;
+    }();
+
+    // ── Token-axis segments: prompt chunks first, then the decode batch ──
+    struct DeltaSeg {
+        int off;                  // first token of the segment
+        int T;                    // timesteps per sequence
+        int S;                    // sequences
+        bool active;              // compact decode segment (slot-mapped)
+        bool tree;                // mapped tree: gather-only, no persistence
+        ggml_tensor * conv_st;
+        ggml_tensor * ssm_st;
+        ggml_tensor * active_ids;
+        ggml_tensor * state_ids;
+    };
+    std::vector<DeltaSeg> segs;
+    segs.reserve((size_t)n_prefill_segments + 1);
+    for (int i = 0; i < n_prefill_segments; ++i) {
+        const QwenPrefillSegment & pf = prefill_segments[i];
+        GGML_ASSERT(pf.seq_slot >= 0 &&
+                    pf.seq_slot < (int)conv_state->ne[2]);
+        ggml_tensor * c = ggml_view_3d(ctx, conv_state,
+            conv_state->ne[0], conv_state->ne[1], 1,
+            conv_state->nb[1], conv_state->nb[2],
+            (size_t)pf.seq_slot * conv_state->nb[2]);
+        ggml_tensor * s = ggml_view_4d(ctx, ssm_state,
+            ssm_state->ne[0], ssm_state->ne[1], ssm_state->ne[2], 1,
+            ssm_state->nb[1], ssm_state->nb[2], ssm_state->nb[3],
+            (size_t)pf.seq_slot * ssm_state->nb[3]);
+        segs.push_back({pf.token_offset, pf.n_tokens, 1,
+                        false, false, c, s, nullptr, nullptr});
+    }
+    if (active_slot_ids) {
+        if (mapped_tree && mapped_ar_seqs > 0) {
+            ggml_tensor * ar_active = ggml_view_1d(
+                ctx, active_slot_ids, mapped_ar_seqs, 0);
+            ggml_tensor * ar_state = ggml_view_1d(
+                ctx, state_slot_ids, mapped_ar_seqs, 0);
+            segs.push_back({0, 1, mapped_ar_seqs, true, false,
+                            conv_state, ssm_state, ar_active, ar_state});
+        }
+        const int tree_tokens = mapped_tree
+            ? (n_tokens - mapped_ar_seqs) / n_seqs : 1;
+        const size_t slot_offset =
+            (size_t)mapped_ar_seqs * active_slot_ids->nb[0];
+        ggml_tensor * segment_active = mapped_ar_seqs > 0
+            ? ggml_view_1d(ctx, active_slot_ids, n_seqs, slot_offset)
+            : active_slot_ids;
+        ggml_tensor * segment_state = mapped_ar_seqs > 0
+            ? ggml_view_1d(ctx, state_slot_ids, n_seqs, slot_offset)
+            : state_slot_ids;
+        segs.push_back({prefill_total + mapped_ar_seqs, tree_tokens,
+                        n_seqs, true, mapped_tree, conv_state, ssm_state,
+                        segment_active, segment_state});
+    } else if (segs.empty()) {
+        // No general [timesteps x sequences] mode: one multi-token sequence.
+        segs.push_back({0, n_tokens, n_seqs, false, false,
+                        conv_state, ssm_state, nullptr, nullptr});
+    }
+    const int n_segs = (int)segs.size();
+
+    // Column slice of a [C, n_tokens] projection; the tensor itself when the
+    // segment spans the whole batch, so single-segment graphs keep today's
+    // topology exactly.
+    auto seg_cols = [&](ggml_tensor * t, int off, int n) -> ggml_tensor * {
+        if (off == 0 && n == (int)t->ne[1]) return t;
+        return ggml_view_2d(ctx, t, t->ne[0], n, t->nb[1],
+                            (size_t)off * t->nb[1]);
+    };
+
+    std::vector<ggml_tensor *> flat((size_t)n_segs, nullptr);
+    for (int si = 0; si < n_segs; si++) {
+    const DeltaSeg & seg = segs[(size_t)si];
+    const int n_seq_tokens = seg.T;
+    const int seg_seqs     = seg.S;
+    const int seg_tokens   = seg.T * seg.S;
+    const bool seg_active = seg.active;
+    const bool seg_tree = seg.tree;
+    DeltaNetCapture * seg_cap = mapped_tree
+        ? (seg_tree ? cap : nullptr) : cap;
+    ggml_tensor * seg_parent_ids = mapped_tree
+        ? (seg_tree ? parent_ids : nullptr) : parent_ids;
+    // Replay log commit composes transitions in token order. Its fixed-chain
+    // capture therefore uses plain recurrence; parent IDs still drive tree
+    // convolution and attention.
+    const bool capture_chain_commit = seg_cap && seg_tree;
+    const bool can_skip_gdn_intermediate =
+        skip_gdn_intermediate && !seg_parent_ids && !seg_cap;
+    // Plain one-token decode has no in-graph consumer of the updated state:
+    // the next graph evaluation is the first read. Write the final state
+    // directly into its persistent slab and avoid materializing/copying a
+    // second S_v x S_v x H_v state. The active-aware path also updates each
+    // mapped physical slab directly; only its negative bucket-padding rows
+    // use the result tensor's retained scratch state region.
+    const bool dense_chain = !ragged && !active_slot_ids && !seg_tree;
+    const bool inplace_state = (seg_active && !seg_tree) ||
+        (allow_inplace_state && can_skip_gdn_intermediate &&
+         !ragged && n_seq_tokens == 1);
+
+    // qkv_2d may be a strided view of the stacked (z | qkv) projection, so
+    // slice it with an explicit 3D view rather than a reshape.
+    ggml_tensor * qkv_mixed = ggml_view_3d(ctx, qkv_2d,
+        conv_channels, n_seq_tokens, seg_seqs,
+        qkv_2d->nb[1], qkv_2d->nb[1] * n_seq_tokens,
+        (size_t)seg.off * qkv_2d->nb[1]);
+    if (use_specla_hld || use_specla_factorized) {
+        qkv_mixed = contig(qkv_mixed);   // the SpecLA conv kernels raw-index x
+    }
+    const bool use_chunked = chunked_env_on && can_skip_gdn_intermediate &&
+        !ragged && !active_slot_ids && !seg_tree &&
+        !use_specla_factorized && !use_specla_hld && n_seq_tokens > 1;
+    const bool fused_plain = fused_kernels_env && fused_kernel_backend &&
+        dense_chain &&
+        !parent_ids && !seg_parent_ids && !use_specla_factorized &&
+        !use_specla_hld;
+    const bool fused_conv = fused_plain;
+    // Concurrent verify (mapped tree segment committed from the replay log):
+    // the dense chain's fusions on kernels that read the mapped base state
+    // in place. One tree-window conv step replaces the history gather,
+    // transpose and concat; the recurrence reads its base slab through the
+    // slot map instead of a gathered copy and writes neither the final
+    // state nor per-token intermediates (the commit replays the log); the
+    // gates are derived in the kernel from strided views of the stacked
+    // projection. Every kernel keeps the op-by-op arithmetic, so the outputs
+    // are bit-identical. DFLASH_QWEN35_NO_FUSED_KERNELS=1 restores the
+    // op-by-op graph.
+    const bool verify_fused = fused_kernels_env && fused_kernel_backend &&
+        seg_active && seg_tree && capture_chain_commit && seg_parent_ids &&
+        !use_chunked && !use_specla_factorized && !use_specla_hld;
+    const bool raw_gates = (fused_plain || verify_fused) && !use_chunked && L.ssm_gate_ba;
+
+    ggml_tensor * beta = nullptr;
+    ggml_tensor * g_tensor = nullptr;
+    if (raw_gates && verify_fused && ba) {
+        // Strided [1, H, T, S] views of the stacked (beta | alpha) projection:
+        // the mapped-verify kernel reads both through one layout, so the two
+        // contiguity copies go away together with the gate ops.
+        const size_t e = ggml_element_size(ba);
+        beta = ggml_view_4d(ctx, ba, 1, num_v_heads, n_seq_tokens, seg_seqs,
+                            e, ba->nb[1], ba->nb[1] * n_seq_tokens,
+                            (size_t)seg.off * ba->nb[1]);
+        g_tensor = ggml_view_4d(ctx, ba, 1, num_v_heads, n_seq_tokens, seg_seqs,
+                                e, ba->nb[1], ba->nb[1] * n_seq_tokens,
+                                (size_t)seg.off * ba->nb[1] + (size_t)num_v_heads * e);
+    } else {
+        beta = ggml_reshape_4d(ctx,
+            seg_cols(beta_2d, seg.off, seg_tokens),
+            1, num_v_heads, n_seq_tokens, seg_seqs);
+        ggml_tensor * alpha = ggml_reshape_3d(ctx,
+            seg_cols(alpha_2d, seg.off, seg_tokens),
+            num_v_heads, n_seq_tokens, seg_seqs);
+        if (raw_gates) {
+            // The kernel applies sigmoid(beta) and softplus(alpha + dt_bias) * A.
+            g_tensor = ggml_reshape_4d(
+                ctx, alpha, 1, num_v_heads, n_seq_tokens, seg_seqs);
+        } else {
+            beta = ggml_sigmoid(ctx, beta);
+            alpha = ggml_add(ctx, alpha, L.ssm_dt_bias);
+            alpha = ggml_softplus(ctx, alpha);
+            g_tensor = ggml_mul(ctx, alpha, L.ssm_a);
+            g_tensor = ggml_reshape_4d(
+                ctx, g_tensor, 1, num_v_heads, n_seq_tokens, seg_seqs);
+        }
+    }
+
+    ggml_tensor * conv_out = nullptr;
+    if (use_specla_hld) {
+        // Delayed convolution commit + HLD verify. The result is already
+        // SiLU'd; raw inputs are written directly to the persistent bank.
+        ggml_tensor * packed = ggml_ssm_conv_specla(
+            ctx, qkv_mixed, L.ssm_conv1d, seg.conv_st,
+            specla_hld, cap->factor_ptrs, cap->factor_n_layers,
+            cap->factor_layer, cap->pending_bank,
+            specla_n_boundaries, specla_n_chains, specla_n_waves,
+            specla_max_parallel_chains);
+        const size_t f32 = sizeof(float);
+        conv_out = ggml_view_3d(ctx, packed,
+            conv_channels, n_seq_tokens, 1,
+            (size_t)conv_channels*f32,
+            (size_t)conv_channels*n_seq_tokens*f32, 0);
+    } else if (verify_fused) {
+        // One kernel assembles [history | x] per mapped slot along the tree
+        // parents and applies silu; the window it writes is the replay-log
+        // commit's input. The persistent history stays read-only.
+        ggml_tensor * packed = ggml_ssm_conv_tree_step(
+            ctx, qkv_mixed, L.ssm_conv1d, seg.conv_st, seg.state_ids, seg_parent_ids);
+        const size_t f32 = sizeof(float);
+        const int64_t window = (int64_t)(w.ssm_d_conv - 1) + n_seq_tokens;
+        conv_out = ggml_view_3d(ctx, packed, conv_channels, n_seq_tokens, seg_seqs,
+                                (size_t)conv_channels * f32,
+                                (size_t)conv_channels * n_seq_tokens * f32, 0);
+        ggml_tensor * conv_input = ggml_view_3d(ctx, packed, window, conv_channels, seg_seqs,
+                                (size_t)window * f32,
+                                (size_t)window * conv_channels * f32,
+                                (size_t)conv_channels * n_seq_tokens * seg_seqs * f32);
+        GGML_ASSERT(!seg_cap->conv_input);
+        seg_cap->conv_input = conv_input;
+        ggml_set_output(seg_cap->conv_input);
+        ggml_build_forward_expand(gf, seg_cap->conv_input);
+    } else {
+    // ── Fetch conv state [kernel-1, conv_channels] and prepend to qkv_mixed
+    //    along the token axis to form the convolution input.
+    ggml_tensor * conv_states_r = nullptr;
+    if (seg_active) {
+        const int64_t slab =
+            (int64_t)(w.ssm_d_conv - 1) * conv_channels;
+        ggml_tensor * all_conv = ggml_reshape_2d(
+            ctx, seg.conv_st, slab, seg.conv_st->ne[2]);
+        ggml_tensor * gathered =
+            ggml_get_rows(ctx, all_conv, seg.state_ids);
+        conv_states_r = ggml_reshape_3d(
+            ctx, gathered, w.ssm_d_conv - 1, conv_channels, seg_seqs);
+    } else {
+        conv_states_r = ggml_reshape_3d(ctx, seg.conv_st,
+            w.ssm_d_conv - 1, conv_channels, seg_seqs);
+    }
+
+    if (fused_conv && !use_specla_factorized) {
+        // One kernel: window = [conv_state | x], silu(conv), history
+        // write-back, and (when capturing) the rollback window copy.
+        ggml_tensor * ci_dst = nullptr;
+        if (seg_cap && seg_cap->conv_input) {
+            const int64_t ci_len = (w.ssm_d_conv - 1) + n_tokens;
+            ci_dst = (ci_len == seg_cap->conv_input->ne[0])
+                ? seg_cap->conv_input
+                : ggml_view_3d(ctx, seg_cap->conv_input,
+                      ci_len, seg_cap->conv_input->ne[1], seg_cap->conv_input->ne[2],
+                      seg_cap->conv_input->nb[1], seg_cap->conv_input->nb[2], 0);
+        }
+        conv_out = ggml_ssm_conv_step(ctx, qkv_mixed, L.ssm_conv1d, conv_states_r, ci_dst);
+    } else {
+        // qkv_mixed currently is [conv_channels, n_tokens, n_seqs]; we need
+        // [n_tokens, conv_channels, n_seqs] to concat on dim 0.
+        ggml_tensor * qkv_T = ggml_transpose(ctx, qkv_mixed);
+
+        ggml_tensor * conv_input = ggml_concat(ctx, conv_states_r, qkv_T, 0);
+        // I0 domain: [0,K_conv-2] are prefix-history rows; tree token flat slot t
+        // (root-inclusive, including synthetic root t=0) is stored at
+        // conv_input row (K_conv-1)+t.
+        // conv_input: [kernel-1 + n_tokens, conv_channels, n_seqs]
+
+        // For spec-decode rollback: copy the full conv_input into the persistent
+        // cache buffer via an in-graph ggml_cpy. This avoids marking conv_input as
+        // a graph output (which would force the gallocr to preserve its memory
+        // past graph_compute). After graph_compute, the cache buffer's data is
+        // always valid; the rollback code slices it at commit_n.
+        if (seg_cap && seg_cap->conv_input && use_specla_factorized) {
+            // The consolidated SpecLA bank is [channels, layers, tokens].
+            // Capture only the raw current inputs; the compatibility commit
+            // shifts the durable K-1 window and appends accepted tokens.
+            GGML_ASSERT(qkv_mixed->ne[0] == seg_cap->conv_input->ne[0]);
+            GGML_ASSERT(n_seq_tokens <= seg_cap->conv_input->ne[1]);
+            ggml_tensor * dst = ggml_view_3d(ctx, seg_cap->conv_input,
+                seg_cap->conv_input->ne[0], n_seq_tokens, 1,
+                seg_cap->conv_input->nb[1], seg_cap->conv_input->nb[2], 0);
+            GGML_ASSERT(ggml_nelements(qkv_mixed) == ggml_nelements(dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, qkv_mixed, dst));
+        } else if (seg_cap && seg_cap->conv_input) {
+            // conv_input may be shorter than the pre-allocated cache
+            // (e.g. during prefill when n_tokens < max_verify_tokens).
+            // Copy into a matching-sized view of the cache destination.
+            const int64_t ci_len = conv_input->ne[0];
+            ggml_tensor * dst;
+            if (ci_len == seg_cap->conv_input->ne[0]) {
+                dst = seg_cap->conv_input;
+            } else {
+                dst = ggml_view_3d(ctx, seg_cap->conv_input,
+                    ci_len, seg_cap->conv_input->ne[1], seg_cap->conv_input->ne[2],
+                    seg_cap->conv_input->nb[1], seg_cap->conv_input->nb[2], 0);
+            }
+            GGML_ASSERT(ggml_nelements(conv_input) == ggml_nelements(dst));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, conv_input, dst));
+        }
+
+        if (seg_cap && seg_tree && !seg_cap->conv_input) {
+            seg_cap->conv_input = conv_input;
+            ggml_set_output(seg_cap->conv_input);
+        }
+
+        // ── Save the last (kernel-1) steps back to conv_state
+        //    SpecLA factorized: skipped — the window is speculative; the
+        //    commit path shifts conv_state and appends accepted raw inputs.
+        ggml_tensor * last_conv = ggml_view_3d(ctx, conv_input,
+            w.ssm_d_conv - 1, conv_channels, seg_seqs,
+            conv_input->nb[1], conv_input->nb[2],
+            (conv_input->ne[0] - (w.ssm_d_conv - 1)) * ggml_element_size(conv_input));
+        if (!use_specla_factorized) {
+          if (seg_active && !seg_tree) {
+            const int64_t slab =
+                (int64_t)(w.ssm_d_conv - 1) * conv_channels;
+            ggml_tensor * compact_last = ggml_reshape_2d(
+                ctx, ggml_cont(ctx, last_conv), slab, seg_seqs);
+            ggml_tensor * all_conv = ggml_reshape_2d(
+                ctx, seg.conv_st, slab, seg.conv_st->ne[2]);
+            ggml_build_forward_expand(
+                gf, ggml_set_rows_masked(
+                        ctx, all_conv, compact_last, seg.active_ids));
+          } else if (!seg_tree) {
+            ggml_build_forward_expand(
+                gf, ggml_cpy(ctx, last_conv, seg.conv_st));
+          }
+        }
+
+        // ── 1D conv + silu
+        //    Tree mode: use the parent-chain-aware variant so sibling nodes gather
+        //    their conv window from their actual tree parent instead of the DFS
+        //    predecessor. Without this, siblings get garbage logits (the conv
+        //    output would mix unrelated branches).
+        conv_out = seg_parent_ids
+            ? ggml_ssm_conv_tree(ctx, conv_input, L.ssm_conv1d, seg_parent_ids)
+            : ggml_ssm_conv     (ctx, conv_input, L.ssm_conv1d);
+        conv_out = ggml_silu(ctx, conv_out);
+    }
+    }  // !use_specla_hld
+
+    // conv_out: [conv_channels, n_tokens, n_seqs]
+    const int64_t q_offset = 0;
+    const int64_t k_offset = num_k_heads * head_k_dim;
+    const int64_t v_offset = 2 * num_k_heads * head_k_dim;
+
+    const size_t elt = ggml_element_size(conv_out);
+    const size_t row_size = conv_channels * elt;
+
+    ggml_tensor * q_c = ggml_view_4d(ctx, conv_out,
+        head_k_dim, num_k_heads, n_seq_tokens, seg_seqs,
+        head_k_dim * elt,
+        row_size,
+        row_size * n_seq_tokens,
+        q_offset * elt);
+    ggml_tensor * k_c = ggml_view_4d(ctx, conv_out,
+        head_k_dim, num_k_heads, n_seq_tokens, seg_seqs,
+        head_k_dim * elt,
+        row_size,
+        row_size * n_seq_tokens,
+        k_offset * elt);
+    ggml_tensor * v_c = ggml_view_4d(ctx, conv_out,
+        head_v_dim, num_v_heads, n_seq_tokens, seg_seqs,
+        head_v_dim * elt,
+        row_size,
+        row_size * n_seq_tokens,
+        v_offset * elt);
+
+    // L2 norm on Q and K: q and k heads are adjacent in conv_out, so one
+    // launch over the [head_k_dim, 2*num_k_heads] slab normalizes both.
+    {
+        ggml_tensor * qk_c = ggml_view_4d(ctx, conv_out,
+            head_k_dim, 2 * num_k_heads, n_seq_tokens, seg_seqs,
+            head_k_dim * elt,
+            row_size,
+            row_size * n_seq_tokens,
+            q_offset * elt);
+        ggml_tensor * qk_n = ggml_l2_norm(ctx, qk_c, w.rms_eps);   // contiguous [hd, 2*Hk, T, S]
+        const size_t ne_ = ggml_element_size(qk_n);
+        q_c = ggml_view_4d(ctx, qk_n, head_k_dim, num_k_heads, n_seq_tokens, seg_seqs,
+                           qk_n->nb[1], qk_n->nb[2], qk_n->nb[3], 0);
+        k_c = ggml_view_4d(ctx, qk_n, head_k_dim, num_k_heads, n_seq_tokens, seg_seqs,
+                           qk_n->nb[1], qk_n->nb[2], qk_n->nb[3],
+                           (size_t)num_k_heads * head_k_dim * ne_);
+    }
+
+    // Repeat Q and K from num_k_heads to num_v_heads so they match V's layout.
+    // The fused active/chain/tree gated_delta_net kernels broadcast heads themselves
+    // (v head h reads q/k head h % num_k_heads, the same tiling ggml_repeat
+    // produces); the chunked and SpecLA paths take the materialized copies.
+    if (num_k_heads != num_v_heads &&
+        (use_chunked || use_specla_factorized || use_specla_hld)) {
+        q_c = ggml_repeat_4d(ctx, q_c, head_k_dim, num_v_heads, n_seq_tokens, seg_seqs);
+        k_c = ggml_repeat_4d(ctx, k_c, head_k_dim, num_v_heads, n_seq_tokens, seg_seqs);
+    }
+
+    // ── SSM state (recurrent): reshape to [S_v, S_v, H_v, n_seqs]
+    ggml_tensor * s = nullptr;
+    if (seg_tree && verify_fused) {
+        // The mapped-verify kernel reads each sequence's base slab through
+        // seg.state_ids and never writes the persistent tensor.
+        s = seg.ssm_st;
+    } else if (seg_tree) {
+        // Packed tree verification starts each tree from the owning slot's
+        // base state. Gather compact slabs, then leave the persistent tensor
+        // untouched; accepted paths are committed by later direct promotion.
+        const int64_t slab =
+            (int64_t)head_v_dim * head_v_dim * num_v_heads;
+        ggml_tensor * all_ssm = ggml_reshape_2d(
+            ctx, seg.ssm_st, slab, seg.ssm_st->ne[3]);
+        ggml_tensor * gathered =
+            ggml_get_rows(ctx, all_ssm, seg.state_ids);
+        s = ggml_reshape_4d(ctx, gathered,
+            head_v_dim, head_v_dim, num_v_heads, seg_seqs);
+    } else {
+        s = seg_active
+            ? seg.ssm_st
+            : ggml_reshape_4d(ctx, seg.ssm_st,
+                head_v_dim, head_v_dim, num_v_heads, seg_seqs);
+    }
+
+    // ── Fused Gated DeltaNet op — returns packed (output | new_state [| intermediates]).
+    //    In tree mode, the kernel uses parent_ids to reload state at DFS
+    //    branch transitions (ported from sglang's retrieve_parent_token path).
+    //    When `seg_cap->ssm_intermediate_states` is present AND we are in tree
+    //    mode, use the _tree_persist variant: the kernel writes per-token
+    //    intermediate states DIRECTLY into the persistent cache buffer,
+    //    eliminating the downstream ggml_cpy that would otherwise copy them.
+    //    Saves ~5-10 ms per verify step (memory-bandwidth bound) on 27B.
+    // tree_persist writes directly to the intermediate buffer. It only supports
+    // F32/F16 output; for Q8_0 intermediates, fall back to the legacy ggml_cpy
+    // path which handles F32→Q8_0 quantization automatically.
+    // persist_inter: when capture is requested, route the kernel's per-token
+    // intermediate-state writes DIRECTLY into the persistent cache buffer via
+    // src[7], avoiding the legacy result-region cpy. This works for both tree
+    // and non-tree (chain-verify) capture and preserves upstream #469 semantics.
+    // Stage 2 split-chain rollback allocates F32 intermediates, so its checkpoint
+    // path is never quantized. In tree mode, n_seq_tokens is root-inclusive and
+    // flat slot t is persisted directly at ne[3] slot t.
+    // Q8_0 intermediates fall through to the guarded legacy copy path below.
+    ggml_tensor * persist_inter = (seg_cap && seg_cap->ssm_intermediate_states
+                                   && (seg_cap->ssm_intermediate_states->type == GGML_TYPE_F32
+                                       || seg_cap->ssm_intermediate_states->type == GGML_TYPE_F16))
+        ? seg_cap->ssm_intermediate_states
+        : nullptr;
+
+    // Chunked delta-net path: chain-only (no parent_ids), no per-token
+    // capture (no cap). Ported from llama.cpp
+    // src/models/delta-net-base.cpp::build_delta_net_chunking. At n_tokens=16
+    // and 48 delta-net layers it eliminates the serial per-token loop that
+    // dominates target-verify compute at long ctx. Currently OFF by
+    // default — port produces correct shape but slightly wrong final state,
+    // causing AL degradation and loopy output. Set DFLASH27B_CHUNKED=1 to
+    // opt in for A/B testing while debugging.
+    ggml_tensor * output = nullptr;
+
+    if (use_specla_hld) {
+        ggml_tensor * result = ggml_gated_delta_net_specla(
+            ctx, q_c, k_c, v_c, g_tensor, beta, s, specla_hld,
+            cap->factor_ptrs, cap->factor_n_layers, cap->factor_layer,
+            cap->pending_bank, specla_n_boundaries,
+            specla_n_chains, specla_n_waves, specla_max_parallel_chains);
+        const int64_t S = head_v_dim;
+        const int64_t H = num_v_heads;
+        const int64_t T = n_seq_tokens;
+        const size_t f32 = sizeof(float);
+        const size_t factor_bytes = (size_t)S*H*T*f32;
+        output = ggml_view_4d(ctx, result, S, H, T, 1,
+            S*f32, (size_t)S*H*f32, factor_bytes, 0);
+        goto after_delta_net;
+    }
+
+    if (use_specla_factorized) {
+        auto r = build_delta_net_specla(ctx, q_c, k_c, v_c, g_tensor, beta, s,
+                                        specla_m_strict, specla_m_incl, specla_m_eye);
+        output = r.output;
+
+        // Factor capture: prefix views of the persistent per-layer buffers.
+        // k as fed to the recurrence (post l2-norm, post head repeat).
+        {
+            ggml_tensor * dst_k = ggml_view_4d(ctx, cap->factor_k,
+                cap->factor_k->ne[0], cap->factor_k->ne[1], n_seq_tokens, 1,
+                cap->factor_k->nb[1], cap->factor_k->nb[2], cap->factor_k->nb[2] * n_seq_tokens, 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, k_c, dst_k));
+
+            // ṽ [n, S_v, 1, H] → logical [S_v, H, n, 1] to match the buffer.
+            ggml_tensor * src_v = ggml_cont(ctx, ggml_permute(ctx, r.v_new, 2, 0, 3, 1));
+            ggml_tensor * dst_v = ggml_view_4d(ctx, cap->factor_v_new,
+                cap->factor_v_new->ne[0], cap->factor_v_new->ne[1], n_seq_tokens, 1,
+                cap->factor_v_new->nb[1], cap->factor_v_new->nb[2], cap->factor_v_new->nb[2] * n_seq_tokens, 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, src_v, dst_v));
+
+            // g⁺ [n, 1, 1, H] → logical [H, n].
+            ggml_tensor * src_g = ggml_cont(ctx, ggml_permute(ctx, r.g_ps, 1, 2, 3, 0));
+            ggml_tensor * dst_g = ggml_view_2d(ctx, cap->factor_g_ps,
+                cap->factor_g_ps->ne[0], n_seq_tokens, cap->factor_g_ps->nb[1], 0);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx, src_g, dst_g));
+        }
+        // Compatibility fallback for callers without an HLD schedule. No
+        // new_state and no state writeback: verification is read-only on
+        // the durable state; specla_commit_accepted() advances it.
+        goto after_delta_net;
+    }
+
+    if (use_chunked) {
+        auto r = build_delta_net_chunked(ctx, q_c, k_c, v_c, g_tensor, beta, s);
+        output = r.output;
+        // The chunked path writes into the same state slot via its 4D view
+        // `s` (a live view over the state tensor), using the same cpy
+        // pattern the sequential path uses for `new_state`.
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, r.new_state, s));
+    } else {
+    ggml_tensor * result;
+    if (seg_active && !seg_tree) {
+        result = ggml_gated_delta_net_active_inplace(
+            ctx, q_c, k_c, v_c, g_tensor, beta, s, seg.active_ids);
+    } else if (seg_parent_ids && !capture_chain_commit) {
+        // Tree verify: _tree_persist wires src[7] internally.
+        result = persist_inter
+            ? ggml_gated_delta_net_tree_persist(ctx, q_c, k_c, v_c, g_tensor, beta, s, seg_parent_ids, persist_inter)
+            : ggml_gated_delta_net_tree(ctx, q_c, k_c, v_c, g_tensor, beta, s, seg_parent_ids);
+    } else {
+        // Non-tree (chain/prefill). When capture is requested, set src[7] so
+        // the kernel writes per-token intermediates directly to the persistent
+        // cache buffer — same mechanism as _tree_persist, but without tree
+        // parent_ids. Avoids the legacy result-region cpy (and the OOB it
+        // could cause if the result tensor has no embedded intermediate region).
+        // In-place final state: the kernel writes the new recurrent state
+        // straight into `s` (a view of the persistent ssm_state), so no
+        // separate 3 MB copy per layer is needed. Tree mode keeps the copy.
+        GGML_ASSERT(!verify_fused || !persist_inter);
+        result = verify_fused
+            ? ggml_gated_delta_net_mapped_verify(ctx, q_c, k_c, v_c, g_tensor, beta, s, seg.state_ids)
+            : inplace_state
+                ? ggml_gated_delta_net_inplace(ctx, q_c, k_c, v_c, g_tensor, beta, s)
+                : ggml_gated_delta_net(ctx, q_c, k_c, v_c, g_tensor, beta, s);
+        if (persist_inter) {
+            result->src[7] = persist_inter;
+        }
+        if (raw_gates) {
+            ggml_gated_delta_net_set_raw_gates(result, L.ssm_gate_ba);
+        }
+    }
+    if (can_skip_gdn_intermediate) {
+        ggml_gated_delta_net_set_skip_intermediate(result, true);
+    }
+    if (capture_chain_commit) {
+        seg_cap->replay_log =
+            ggml_gated_delta_net_capture_replay_log(ctx, result);
+        ggml_set_output(seg_cap->replay_log);
+        ggml_build_forward_expand(gf, seg_cap->replay_log);
+    }
+
+    // Slice output and new_state out of the packed result
+    const int64_t S_v = head_v_dim;
+    const int64_t H_v = num_v_heads;
+    const size_t r_elt = ggml_element_size(result);
+    output = ggml_view_4d(ctx, result,
+        S_v, H_v, n_seq_tokens, seg_seqs,
+        S_v * r_elt,
+        S_v * H_v * r_elt,
+        S_v * H_v * n_seq_tokens * r_elt,
+        0);
+    if (!inplace_state && !seg_tree) {
+        ggml_tensor * new_state = ggml_view_4d(ctx, result,
+            S_v, S_v, H_v, seg_seqs,
+            S_v * r_elt,
+            S_v * S_v * r_elt,
+            S_v * S_v * H_v * r_elt,
+            S_v * H_v * n_seq_tokens * seg_seqs * r_elt);
+
+        // Persist new_state back to cache. Mapped trees deliberately skip
+        // this branch: their gathered base state is read-only.
+        ggml_build_forward_expand(gf, ggml_cpy(ctx, new_state, seg.ssm_st));
+    }
+
+    // Expose per-step intermediate states for spec-decode rollback. The patched
+    // ggml_gated_delta_net kernel appends an intermediate-states region to the
+    // result tensor after the final-state slot. Layout in result->data:
+    //   [ attn_out: S_v*H_v*n_seq_tokens*n_seqs floats
+    //   | final_state: S_v*S_v*H_v*n_seqs floats
+    //   | intermediate_states: S_v*S_v*H_v*n_seq_tokens*n_seqs floats ]
+    //
+    // Instead of marking the whole `result` tensor as a graph output (which
+    // forces gallocr to preserve ~50 MB per layer × 48 layers of otherwise
+    // transient memory and inflates graph_build by ~35 ms), we create a VIEW
+    // into the intermediate region and ggml_cpy it into the persistent cache
+    // buffer seg_cap->ssm_intermediate_states. The gallocr is unaware of the
+    // persistent cache, so verify_build stays cheap. Matches SGLang's
+    // mamba_caches.intermediate_ssm pattern.
+    if (seg_cap && seg_cap->ssm_intermediate_states && !persist_inter) {
+        // This path is only reachable when the intermediate buffer is a type
+        // persist routing can't handle (persist requires F32/F16; the cache
+        // allocates F16, so this is normally dead). If the result tensor has no
+        // embedded intermediate region, the legacy cpy would read OOB. Fail
+        // loudly rather than silently leaving the rollback buffer stale.
+        GGML_ABORT(
+            "non-tree GDN intermediate capture requires an F32/F16 persist buffer "
+            "(got type %d); use F16 intermediates (the default) or the tree-verify path.",
+            (int)seg_cap->ssm_intermediate_states->type);
+    }
+    }
+
+after_delta_net:
+    // ── Gated output norm: rms_norm(output) * silu(z_4d)
+    ggml_tensor * z_4d = ggml_reshape_4d(ctx,
+        contig(seg_cols(z, seg.off, seg_tokens)),
+        head_v_dim, num_v_heads, n_seq_tokens, seg_seqs);
+    ggml_tensor * output_n = ggml_rms_norm(ctx, rms_norm_input_f32(ctx, output), w.rms_eps);
+    output_n = ggml_mul(ctx, output_n, L.ssm_norm);
+    ggml_tensor * z_silu  = ggml_silu(ctx, z_4d);
+    output_n = ggml_mul(ctx, output_n, z_silu);
+
+    // Reshape to [d_inner, seg_tokens]
+    flat[si] = ggml_reshape_2d(ctx, output_n,
+        head_v_dim * num_v_heads, seg_tokens);
+    }  // segment loop
+
+    // ── Output projection over the whole batch (one weight read)
+    ggml_tensor * flat_all = flat[0];
+    for (int si = 1; si < n_segs; si++) {
+        flat_all = ggml_concat(ctx, flat_all, flat[(size_t)si], 1);
+    }
+    ggml_tensor * out = apply_scale2(ctx, ggml_mul_mat(ctx, L.ssm_out, flat_all), L.ssm_out_s);
+    out = ggml_reshape_2d(ctx, out, w.n_embd, n_tokens);
+    return out;
+}
+
+// ─── Main graph builder ─────────────────────────────────────────────
+
+// Build a single layer of the Qwen3.5-27B model.
+// layer_idx: which of the 64 layers to build (0-based).
+// inp:      input activation [hidden, n_tokens]
+// Returns the output activation [hidden, n_tokens].
+static ggml_tensor * build_single_layer(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor *         inp,         // [hidden, n_tokens]
+    ggml_tensor *         positions,   // [4 * n_tokens] i32 (M-RoPE)
+    ggml_tensor *         attn_mask,   // optional causal mask
+    int                   kv_start,
+    int                   n_tokens,
+    bool                  capture,
+    int                   fa_window = 0,
+    ggml_tensor *         q_tail_capture = nullptr,
+    int                   q_tail_start = 0,
+    ggml_tensor **        moe_selected_out = nullptr,
+    ggml_tensor *         kv_write_rows = nullptr,
+    ggml_tensor *         parent_ids = nullptr)
+{
+    const int hidden = w.n_embd;
+    const float eps   = w.rms_eps;
+    const TargetLayer & L = w.layers[layer_idx];
+    const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
+
+    const int * CAPTURE_LAYERS = w.capture_layer_ids;
+    const int N_CAPTURE = w.n_capture_layers;
+
+    ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inp);
+    ggml_tensor * inpSA = inp_f32;
+    ggml_tensor * cur   = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
+
+    if (is_attn) {
+        int fa_idx = 0;
+        for (int il = 0; il < layer_idx; il++) {
+            if (((il + 1) % w.full_attention_interval) == 0) fa_idx++;
+        }
+        cur = w.is_bailingmoe3
+            ? build_bailingmoe3_mla_block(
+                ctx, gf, w, L, cur, positions,
+                cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                attn_mask, kv_start, n_tokens)
+            : build_full_attn_block(
+                ctx, gf, w, L, cur, positions, w.rope_sections,
+                cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                attn_mask, kv_start, n_tokens,
+                cache.kv_k_type, cache.kv_v_type,
+                cache.kv_k_rotated, fa_window,
+                q_tail_capture, q_tail_start, kv_write_rows);
+    } else {
+        int dn_idx = 0;
+        for (int il = 0; il < layer_idx; il++) {
+            if (((il + 1) % w.full_attention_interval) != 0) dn_idx++;
+        }
+        DeltaNetCapture cap{};
+        DeltaNetCapture * cap_ptr = nullptr;
+        if (capture) {
+            cap_ptr = &cap;
+            cap_ptr->ssm_intermediate_states = cache.ssm_intermediate[dn_idx];
+            cap_ptr->conv_input              = cache.conv_input_cache[dn_idx];
+        }
+        cur = w.is_bailingmoe3
+            ? build_bailingmoe3_kda_block(
+                ctx, gf, w, L, cur, cache.conv_state[dn_idx],
+                cache.ssm_state[dn_idx], n_tokens)
+            : build_delta_net_block(
+                ctx, gf, w, L, cur,
+                cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
+                n_tokens, cap_ptr, parent_ids,
+                /*skip_gdn_intermediate=*/true,
+                supports_qwen35_fused_kernels(cache.backend));
+    }
+
+    cur = ggml_add(ctx, cur, inpSA);
+
+    ggml_tensor * ffn_residual = cur;
+    ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
+    ggml_tensor * moe_selected = nullptr;
+    ggml_tensor * ffn  = L.ffn_gate_inp
+        ? build_qwen35moe_ffn(ctx, post, w, L, &moe_selected)
+        : build_swiglu_ffn(ctx, post, L);
+    if (moe_selected_out) {
+        *moe_selected_out = moe_selected;
+    }
+    cur = ggml_add(ctx, ffn, ffn_residual);
+
+    if (capture && cache.target_feat) {
+        int capture_idx = -1;
+        for (int k = 0; k < N_CAPTURE; k++) {
+            if (CAPTURE_LAYERS[k] == layer_idx) { capture_idx = k; break; }
+        }
+        if (capture_idx >= 0) {
+            const size_t elt        = ggml_element_size(cache.target_feat);
+            const size_t col_stride = cache.target_feat->nb[1];
+            const int    cap        = cache.target_feat_cap;
+            const int    slot_start = kv_start % cap;
+            const int    pre_n      = std::min(n_tokens, cap - slot_start);
+            const int    post_n     = n_tokens - pre_n;
+
+            ggml_tensor * cur_2d = ggml_reshape_2d(ctx, cur, hidden, n_tokens);
+
+            {
+                const size_t offset =
+                    (size_t)slot_start * col_stride +
+                    (size_t)capture_idx * hidden * elt;
+                ggml_tensor * slot = ggml_view_2d(ctx, cache.target_feat,
+                    hidden, pre_n, col_stride, offset);
+                ggml_tensor * src  = ggml_view_2d(ctx, cur_2d,
+                    hidden, pre_n, cur_2d->nb[1], 0);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, src, slot));
+            }
+            if (post_n > 0) {
+                const size_t offset =
+                    (size_t)capture_idx * hidden * elt;
+                ggml_tensor * slot = ggml_view_2d(ctx, cache.target_feat,
+                    hidden, post_n, col_stride, offset);
+                ggml_tensor * src  = ggml_view_2d(ctx, cur_2d,
+                    hidden, post_n, cur_2d->nb[1],
+                    (size_t)pre_n * cur_2d->nb[1]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, src, slot));
+            }
+        }
+    }
+
+    return cur;
+}
+
+QwenGraphOutputs build_qwen35_graph(
+    ggml_context *         ctx,
+    ggml_cgraph *          gf,
+    const TargetWeights &  w,
+    TargetCache &          cache,
+    const QwenGraphInputs & in) {
+
+    const int n_tokens = in.n_tokens;
+
+    // 1. Caller supplies pre-embedded inputs via in.inp_embed (CPU lookup done
+    //    ahead of time, zero GPU cost for the embedding table).
+    ggml_tensor * inpL = in.inp_embed;
+
+    int fa_idx = 0, dn_idx = 0;
+
+    // If the caller requested capture, size the output list to the total delta-
+    // net layer count so we can index by dn_idx as we iterate the layers.
+    QwenGraphOutputs og_early{};
+    if (in.capture_delta_intermediate || in.capture_tree_commit) {
+        const int n_full_attn = w.n_layer / w.full_attention_interval;
+        const int n_delta     = w.n_layer - n_full_attn;
+        og_early.delta_captures.resize(n_delta);
+    }
+    if (in.capture_moe_router && w.is_moe) {
+        og_early.moe_selected.assign((size_t)w.n_layer, nullptr);
+    }
+
+    // DFlash target layer IDs for feature capture (from TargetWeights config).
+    const int * CAPTURE_LAYERS = w.capture_layer_ids;
+    const int N_CAPTURE = w.n_capture_layers;
+
+    const int hidden = w.n_embd;
+    const float eps  = w.rms_eps;
+    const bool capture_with_rows =
+        in.capture_layers && cache.target_feat && in.target_feat_rows;
+    const bool capture_tree_features =
+        in.capture_layers && in.capture_tree_commit && cache.target_feat;
+    std::vector<ggml_tensor *> capture_slices;
+    if (capture_with_rows || capture_tree_features) {
+        capture_slices.assign((size_t)N_CAPTURE, nullptr);
+    }
+
+    for (int il = 0; il < w.n_layer; il++) {
+        const TargetLayer & L = w.layers[il];
+        const bool is_attn = (((il + 1) % w.full_attention_interval) == 0);
+
+        ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inpL);
+        ggml_tensor * inpSA = inp_f32;
+
+        // Pre-attention norm
+        ggml_tensor * cur = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
+
+        if (is_attn) {
+            const bool want_q_cap = in.q_capture && cache.q_cap;
+            ggml_tensor * q_fa = nullptr;
+            if (w.is_bailingmoe3) {
+                GGML_ASSERT(!in.kv_write_rows && !in.paged_block_table &&
+                            !in.paged_query_seq_ids && !in.tree_sizes &&
+                            in.n_seqs == 1);
+                cur = build_bailingmoe3_mla_block(
+                    ctx, gf, w, L, cur, in.positions,
+                    cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                    in.attn_mask, in.kv_start, n_tokens);
+            } else {
+                cur = build_full_attn_block(ctx, gf, w, L, cur, in.positions, w.rope_sections,
+                                            cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                                            in.attn_mask, in.kv_start, n_tokens,
+                                            cache.kv_k_type, cache.kv_v_type,
+                                            cache.kv_k_rotated,
+                                            in.fa_window,
+                                            /*q_tail_capture=*/nullptr,
+                                            /*q_tail_start=*/0,
+                                            in.kv_write_rows,
+                                            want_q_cap ? &q_fa : nullptr,
+                                            in.paged_block_table,
+                                            in.paged_kv_seq_lens,
+                                            in.paged_query_seq_ids,
+                                            in.paged_query_positions,
+                                            in.paged_max_kv_len,
+                                            in.active_slot_ids,
+                                            in.tree_sizes ? in.parent_ids : nullptr,
+                                            in.tree_sizes,
+                                            in.tree_width,
+                                            in.tree_scratch_base,
+                                            in.tree_scratch_stride,
+                                            cache.max_ctx);
+            }
+            if (want_q_cap && q_fa) {
+                // Last token's Q, all heads: src [head_dim, 1, n_head] view of
+                // [head_dim, n_tokens, n_head]; dst = q_cap plane fa_idx
+                // ([head_dim, n_head] viewed as [head_dim, 1, n_head]).
+                ggml_tensor * src = ggml_view_3d(ctx, q_fa,
+                    q_fa->ne[0], 1, q_fa->ne[2],
+                    q_fa->nb[1], q_fa->nb[2],
+                    (size_t)(n_tokens - 1) * q_fa->nb[1]);
+                src = ggml_cont(ctx, src);   // strided head axis -> packed
+                ggml_tensor * dst = ggml_view_3d(ctx, cache.q_cap,
+                    cache.q_cap->ne[0], 1, cache.q_cap->ne[1],
+                    cache.q_cap->nb[1], cache.q_cap->nb[1],
+                    (size_t)fa_idx * cache.q_cap->nb[2]);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, src, dst));
+            }
+            fa_idx++;
+        } else {
+            DeltaNetCapture * cap_ptr = nullptr;
+            if (in.capture_delta_intermediate || in.capture_tree_commit) {
+                cap_ptr = &og_early.delta_captures[dn_idx];
+                // Point at the persistent per-layer cache buffers so
+                // build_delta_net_block can ggml_cpy into them during graph
+                // execution. The caller (test_dflash.cpp spec loop) reads from
+                // these tensors post-compute; their ->data pointers are always
+                // valid because they're cache-resident, not gallocr-managed.
+                if (in.capture_delta_intermediate) {
+                    cap_ptr->ssm_intermediate_states = cache.ssm_intermediate[dn_idx];
+                    cap_ptr->conv_input              = cache.conv_input_cache[dn_idx];
+                    if (!cache.factor_k.empty()) {
+                        const bool pending_alt = cache.specla_pending_bank != 0;
+                        cap_ptr->pending_factor_k = pending_alt
+                            ? cache.factor_k_alt[dn_idx] : cache.factor_k[dn_idx];
+                        cap_ptr->pending_factor_v_new = pending_alt
+                            ? cache.factor_v_new_alt[dn_idx] : cache.factor_v_new[dn_idx];
+                        cap_ptr->pending_factor_g = pending_alt
+                            ? cache.factor_g_ps_alt[dn_idx] : cache.factor_g_ps[dn_idx];
+                        cap_ptr->pending_conv_input = pending_alt
+                            ? cache.conv_input_cache_alt[dn_idx] : cache.conv_input_cache[dn_idx];
+                        cap_ptr->factor_k = pending_alt
+                            ? cache.factor_k[dn_idx] : cache.factor_k_alt[dn_idx];
+                        cap_ptr->factor_v_new = pending_alt
+                            ? cache.factor_v_new[dn_idx] : cache.factor_v_new_alt[dn_idx];
+                        cap_ptr->factor_g_ps = pending_alt
+                            ? cache.factor_g_ps[dn_idx] : cache.factor_g_ps_alt[dn_idx];
+                        cap_ptr->conv_input = pending_alt
+                            ? cache.conv_input_cache[dn_idx] : cache.conv_input_cache_alt[dn_idx];
+                        cap_ptr->factor_ptrs = cache.specla_factor_ptrs;
+                        cap_ptr->factor_n_layers = (int)cache.factor_k.size();
+                        cap_ptr->factor_layer = dn_idx;
+                        cap_ptr->pending_bank = cache.specla_pending_bank;
+                    }
+                }
+            }
+            ggml_tensor * conv_st = cache.conv_state[dn_idx];
+            ggml_tensor * ssm_st  = cache.ssm_state[dn_idx];
+            // Prefill segments advance their recurrent state in their own
+            // slots' slabs (zeroed at admission by reset_recurrent_slot);
+            // build_delta_net_block views each slab itself. Safe alongside
+            // decode: the batched decode segment writes state only through
+            // active_slot_ids, which never name a prefilling slot.
+            if (cache.n_seq_slots > 1 && in.n_seqs == 1 &&
+                in.n_prefill_segments == 0 && !in.active_slot_ids) {
+                // Plain single-sequence forward against a multi-slot cache:
+                // this slot's contiguous slab.
+                conv_st = ggml_view_3d(ctx, conv_st,
+                    conv_st->ne[0], conv_st->ne[1], 1,
+                    conv_st->nb[1], conv_st->nb[2],
+                    (size_t)in.seq_slot * conv_st->nb[2]);
+                ssm_st = ggml_view_4d(ctx, ssm_st,
+                    ssm_st->ne[0], ssm_st->ne[1], ssm_st->ne[2], 1,
+                    ssm_st->nb[1], ssm_st->nb[2], ssm_st->nb[3],
+                    (size_t)in.seq_slot * ssm_st->nb[3]);
+            }
+            if (w.is_bailingmoe3) {
+                GGML_ASSERT(!cap_ptr && !in.parent_ids && in.n_seqs == 1 &&
+                            in.n_prefill_segments == 0 && !in.active_slot_ids);
+                cur = build_bailingmoe3_kda_block(
+                    ctx, gf, w, L, cur, conv_st, ssm_st, n_tokens);
+            } else {
+                cur = build_delta_net_block(ctx, gf, w, L, cur,
+                                            conv_st, ssm_st,
+                                             n_tokens, cap_ptr, in.parent_ids,
+                                             /*skip_gdn_intermediate=*/true,
+                                             supports_qwen35_fused_kernels(cache.backend),
+                                             in.n_seqs,
+                                             in.prefill_segments,
+                                             in.n_prefill_segments,
+                                             in.active_slot_ids,
+                                             in.state_slot_ids,
+                                             in.mapped_ar_seqs,
+                                             /*allow_inplace_state=*/
+                                                 in.n_prefill_tokens == 0,
+                                            in.specla_m_strict, in.specla_m_incl,
+                                            in.specla_m_eye, in.specla_hld,
+                                            in.specla_n_boundaries,
+                                            in.specla_n_chains,
+                                            in.specla_n_waves,
+                                             in.specla_max_parallel_chains);
+            }
+            dn_idx++;
+        }
+
+        // Residual
+        cur = ggml_add(ctx, cur, inpSA);
+
+        // Post-attention norm (before FFN)
+        ggml_tensor * ffn_residual = cur;
+        ggml_tensor * post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
+
+        // FFN (dense SwiGLU for qwen35, MoE for qwen35moe)
+        ggml_tensor * moe_selected = nullptr;
+        ggml_tensor * ffn = L.ffn_gate_inp
+            ? build_qwen35moe_ffn(ctx, post, w, L,
+                                  in.capture_moe_router ? &moe_selected : nullptr)
+            : build_swiglu_ffn(ctx, post, L);
+        if (in.capture_moe_router && moe_selected) {
+            ggml_set_output(moe_selected);
+            og_early.moe_selected[(size_t)il] = moe_selected;
+        }
+        cur = ggml_add(ctx, ffn, ffn_residual);
+
+        // ── DFlash layer feature capture ──
+        // Write `cur` into the rolling target_feat buffer. The buffer is a
+        // ring of `target_feat_cap` slots; position P maps to slot P%cap.
+        // Within a single build call we may straddle the wrap boundary, so
+        // we split the copy into up to two contiguous ggml_cpy ops.
+        if (in.capture_layers && cache.target_feat) {
+            int capture_idx = -1;
+            for (int k = 0; k < N_CAPTURE; k++) {
+                if (CAPTURE_LAYERS[k] == il) { capture_idx = k; break; }
+            }
+            if (capture_idx >= 0) {
+                ggml_tensor * cur_2d =
+                    ggml_reshape_2d(ctx, cur, hidden, n_tokens);
+                if (capture_with_rows || capture_tree_features) {
+                    capture_slices[(size_t)capture_idx] = cur_2d;
+                    inpL = cur;
+                    continue;
+                }
+                const size_t elt        = ggml_element_size(cache.target_feat);
+                const size_t col_stride = cache.target_feat->nb[1];
+                const int    cap        = cache.target_feat_cap;
+                const int    slot_start = in.kv_start % cap;
+                const int    pre_n      = std::min(n_tokens, cap - slot_start);
+                const int    post_n    = n_tokens - pre_n;
+
+                // First slice: [slot_start..slot_start+pre_n) in the ring.
+                {
+                    const size_t offset =
+                        (size_t)slot_start * col_stride +
+                        (size_t)capture_idx * hidden * elt;
+                    ggml_tensor * slot = ggml_view_2d(ctx, cache.target_feat,
+                        hidden, pre_n, col_stride, offset);
+                    ggml_tensor * src  = ggml_view_2d(ctx, cur_2d,
+                        hidden, pre_n, cur_2d->nb[1], 0);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx, src, slot));
+                }
+
+                // Second slice: wrap-around at [0..post_n) if needed.
+                if (post_n > 0) {
+                    const size_t offset =
+                        (size_t)capture_idx * hidden * elt;
+                    ggml_tensor * slot = ggml_view_2d(ctx, cache.target_feat,
+                        hidden, post_n, col_stride, offset);
+                    ggml_tensor * src  = ggml_view_2d(ctx, cur_2d,
+                        hidden, post_n, cur_2d->nb[1],
+                        (size_t)pre_n * cur_2d->nb[1]);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx, src, slot));
+                }
+            }
+        }
+
+        inpL = cur;
+    }
+
+    if (capture_with_rows || capture_tree_features) {
+        GGML_ASSERT(!capture_slices.empty());
+        ggml_tensor * feat_cat = capture_slices[0];
+        GGML_ASSERT(feat_cat);
+        for (int k = 1; k < (int)capture_slices.size(); ++k) {
+            GGML_ASSERT(capture_slices[(size_t)k]);
+            feat_cat = ggml_concat(
+                ctx, feat_cat, capture_slices[(size_t)k], 0);
+        }
+        feat_cat = ggml_cont(ctx, feat_cat);
+        if (capture_tree_features) {
+            og_early.tree_features = ggml_cast(ctx, feat_cat, GGML_TYPE_BF16);
+            ggml_set_output(og_early.tree_features);
+            ggml_build_forward_expand(gf, og_early.tree_features);
+        } else {
+            ggml_build_forward_expand(
+                gf, ggml_set_rows(
+                        ctx, cache.target_feat, feat_cat,
+                        in.target_feat_rows));
+        }
+    }
+
+    // 2. Final norm
+    ggml_tensor * out = rms_norm_mul(ctx, inpL, w.out_norm, w.rms_eps);
+
+    // 3. LM head — optionally only for sampled rows (prefill computes just
+    //    the last row; fused steps the decode rows plus committing prompts'
+    //    last rows. Saves the [vocab, n_tokens] matmul and ~233MB scratch
+    //    at ubatch=384). Multi-prompt steps sample scattered rows, so they
+    //    gather by explicit index instead of a tail view.
+    ggml_tensor * logits = nullptr;
+    if (w.output) {
+        if (in.logits_row_indices) {
+            out = ggml_get_rows(ctx, out, in.logits_row_indices);
+        } else if (in.logits_tail_rows > 0 && in.logits_tail_rows < n_tokens) {
+            out = ggml_view_2d(ctx, out, hidden, in.logits_tail_rows,
+                               out->nb[1],
+                               (size_t)(n_tokens - in.logits_tail_rows) *
+                                   out->nb[1]);
+        }
+        logits = ggml_mul_mat(ctx, w.output, out);
+        ggml_set_name(logits, "logits");
+        ggml_build_forward_expand(gf, logits);
+    } else {
+        ggml_set_name(out, "result_norm");
+        ggml_build_forward_expand(gf, out);
+    }
+
+    QwenGraphOutputs og = std::move(og_early);
+    og.logits = logits;
+    return og;
+}
+
+ggml_tensor * build_qwen35_layer(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor *         inp,
+    ggml_tensor *         positions,
+    ggml_tensor *         attn_mask,
+    int                   kv_start,
+    int                   n_tokens,
+    bool                  capture,
+    int                   fa_window,
+    ggml_tensor *         q_tail_capture,
+    int                   q_tail_start,
+    ggml_tensor *         kv_write_rows,
+    ggml_tensor *         parent_ids)
+{
+    return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
+                              attn_mask, kv_start, n_tokens, capture, fa_window,
+                              q_tail_capture, q_tail_start, nullptr,
+                              kv_write_rows, parent_ids);
+}
+
+ggml_tensor * build_qwen35_layer(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor *         inp,
+    ggml_tensor *         positions,
+    ggml_tensor *         attn_mask,
+    int                   kv_start,
+    int                   n_tokens,
+    bool                  capture,
+    int                   fa_window,
+    ggml_tensor *         q_tail_capture,
+    int                   q_tail_start,
+    ggml_tensor **        moe_selected_out,
+    ggml_tensor *         kv_write_rows,
+    ggml_tensor *         parent_ids)
+{
+    return build_single_layer(ctx, gf, w, cache, layer_idx, inp, positions,
+                              attn_mask, kv_start, n_tokens, capture, fa_window,
+                              q_tail_capture, q_tail_start, moe_selected_out,
+                              kv_write_rows, parent_ids);
+}
+
+QwenLayerPrefnOutputs build_qwen35_layer_prefn(
+    ggml_context *        ctx,
+    ggml_cgraph *         gf,
+    const TargetWeights & w,
+    TargetCache &         cache,
+    int                   layer_idx,
+    ggml_tensor *         inp,
+    ggml_tensor *         positions,
+    ggml_tensor *         attn_mask,
+    int                   kv_start,
+    int                   n_tokens,
+    int                   fa_window,
+    ggml_tensor *         kv_write_rows,
+    bool                  skip_gdn_intermediate) {
+    QwenLayerPrefnOutputs out{};
+    const float eps = w.rms_eps;
+    const TargetLayer & L = w.layers[layer_idx];
+    const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
+
+    ggml_tensor * inp_f32 = graph_tensor_f32(ctx, inp);
+    ggml_tensor * inpSA = inp_f32;
+    ggml_tensor * cur   = rms_norm_mul(ctx, inp_f32, L.attn_norm, eps);
+
+    if (is_attn) {
+        int fa_idx = 0;
+        for (int il = 0; il < layer_idx; il++) {
+            if (((il + 1) % w.full_attention_interval) == 0) fa_idx++;
+        }
+        cur = w.is_bailingmoe3
+            ? build_bailingmoe3_mla_block(
+                ctx, gf, w, L, cur, positions,
+                cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                attn_mask, kv_start, n_tokens)
+            : build_full_attn_block(
+                ctx, gf, w, L, cur, positions, w.rope_sections,
+                cache.attn_k[fa_idx], cache.attn_v[fa_idx],
+                attn_mask, kv_start, n_tokens,
+                cache.kv_k_type, cache.kv_v_type,
+                cache.kv_k_rotated, fa_window,
+                /*q_tail_capture=*/nullptr, /*q_tail_start=*/0,
+                kv_write_rows);
+    } else {
+        int dn_idx = 0;
+        for (int il = 0; il < layer_idx; il++) {
+            if (((il + 1) % w.full_attention_interval) != 0) dn_idx++;
+        }
+        cur = w.is_bailingmoe3
+            ? build_bailingmoe3_kda_block(
+                ctx, gf, w, L, cur, cache.conv_state[dn_idx],
+                cache.ssm_state[dn_idx], n_tokens)
+            : build_delta_net_block(
+                ctx, gf, w, L, cur,
+                cache.conv_state[dn_idx], cache.ssm_state[dn_idx],
+                n_tokens, nullptr, nullptr, skip_gdn_intermediate,
+                supports_qwen35_fused_kernels(cache.backend));
+    }
+
+    cur = ggml_add(ctx, cur, inpSA);
+    out.residual = cur;
+    out.post = rms_norm_mul(ctx, cur, L.attn_post_norm, eps);
+    if (L.ffn_gate_inp) {
+        // selected/weights are read back by the host (hybrid hot/cold expert
+        // compute), not consumed in-graph. argsort_top_k yields a strided view
+        // whose raw packed readback returns garbage ids for tokens > 0 (crash
+        // in expert dispatch on the first multi-token prefill); top_k is
+        // contiguous, and cheaper than a full argsort here.
+        Qwen35MoeRouterOutputs router = build_qwen35moe_router(
+            ctx, out.post, w, L, /*allow_fused_router=*/false);
+        out.moe_selected = router.selected;
+        out.moe_weights = router.weights;
+    }
+    return out;
+}
+
+// ─── Cross-request prefix snapshot (Phase A) ─────────────────────────
+
+bool snapshot_target_cache(const TargetWeights & w,
+                           const TargetCache & cache,
+                           ggml_backend_t backend,
+                           PrefixSnapshot & snap) {
+    if (cache.n_seq_slots > 1) {
+        set_last_error("snapshot_target_cache: multi-slot caches are unsupported");
+        return false;
+    }
+
+    const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
+    const int n_delta     = w.n_layer - n_full_attn;               // 48
+    const int snap_pos    = cache.cur_pos;
+
+    if (snap_pos <= 0) {
+        set_last_error("snapshot_target_cache: cur_pos <= 0");
+        return false;
+    }
+
+    // Reuse existing buffer if shapes match (same cur_pos); otherwise reallocate.
+    // Right-sized KV tensors use [head_dim, cur_pos, n_head_kv] — orders of
+    // magnitude smaller than [head_dim, max_ctx, n_head_kv] for short prefixes.
+    const bool needs_alloc = snap.ctx == nullptr ||
+        snap.layout != PrefixSnapshot::Layout::dense ||
+        snap.cur_pos != snap_pos;
+    if (needs_alloc) {
+        free_prefix_snapshot(snap);
+
+        const int total_tensors = 2 * n_full_attn + 2 * n_delta + 1; // 65
+        ggml_init_params ip{};
+        ip.mem_size   = (size_t)(total_tensors + 16) * ggml_tensor_overhead();
+        ip.mem_buffer = nullptr;
+        ip.no_alloc   = true;
+        snap.ctx = ggml_init(ip);
+        if (!snap.ctx) { set_last_error("PrefixSnapshot ggml_init failed"); return false; }
+
+        snap.attn_k_snap.assign(n_full_attn, nullptr);
+        snap.attn_v_snap.assign(n_full_attn, nullptr);
+        snap.ssm_state_snap.assign(n_delta, nullptr);
+        snap.conv_state_snap.assign(n_delta, nullptr);
+
+        // Right-sized KV: [head_dim, snap_pos, n_head_kv]
+        for (int i = 0; i < n_full_attn; i++) {
+            ggml_tensor * sk = cache.attn_k[i];
+            ggml_tensor * sv = cache.attn_v[i];
+            if (!sk || !sv) continue;
+            ggml_tensor * K = ggml_new_tensor_3d(snap.ctx, sk->type, sk->ne[0], snap_pos, sk->ne[2]);
+            ggml_tensor * V = ggml_new_tensor_3d(snap.ctx, sv->type, sv->ne[0], snap_pos, sv->ne[2]);
+            char name[64];
+            std::snprintf(name, sizeof(name), "snap_cache_k_%d", i); ggml_set_name(K, name);
+            std::snprintf(name, sizeof(name), "snap_cache_v_%d", i); ggml_set_name(V, name);
+            snap.attn_k_snap[i] = K;
+            snap.attn_v_snap[i] = V;
+        }
+
+        // SSM / conv: full-size (position-independent recurrent state).
+        for (int i = 0; i < n_delta; i++) {
+            ggml_tensor * ss = cache.ssm_state[i];
+            ggml_tensor * cs = cache.conv_state[i];
+            if (!ss || !cs) continue;
+            ggml_tensor * S = ggml_new_tensor_3d(snap.ctx, ss->type, ss->ne[0], ss->ne[1], ss->ne[2]);
+            ggml_tensor * C = ggml_new_tensor_2d(snap.ctx, cs->type, cs->ne[0], cs->ne[1]);
+            char name[64];
+            std::snprintf(name, sizeof(name), "snap_ssm_state_%d", i);  ggml_set_name(S, name);
+            std::snprintf(name, sizeof(name), "snap_conv_state_%d", i); ggml_set_name(C, name);
+            snap.ssm_state_snap[i]  = S;
+            snap.conv_state_snap[i] = C;
+        }
+
+        // Right-sized target_feat: [fc_in, min(snap_pos, target_feat_cap)]
+        if (cache.target_feat) {
+            ggml_tensor * tf = cache.target_feat;
+            const int feat_len = std::min(snap_pos, cache.target_feat_cap);
+            snap.target_feat_snap = ggml_new_tensor_2d(snap.ctx, tf->type, tf->ne[0], feat_len);
+            ggml_set_name(snap.target_feat_snap, "snap_target_feat");
+        } else {
+            snap.target_feat_snap = nullptr;
+        }
+
+        snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend);
+        if (!snap.buf) {
+            set_last_error("ggml_backend_alloc_ctx_tensors failed for PrefixSnapshot");
+            ggml_free(snap.ctx);
+            snap.ctx = nullptr;
+            snap.attn_k_snap.clear();
+            snap.attn_v_snap.clear();
+            snap.ssm_state_snap.clear();
+            snap.conv_state_snap.clear();
+            snap.target_feat_snap = nullptr;
+            return false;
+        }
+        std::fprintf(stderr, "[snap] alloc right-sized: cur_pos=%d buf=%.2f MiB backend=%s\n",
+                     snap_pos,
+                     (double)ggml_backend_buffer_get_size(snap.buf) / 1024.0 / 1024.0,
+                     ggml_backend_name(backend));
+    }
+
+    // Copy KV strip-by-strip (right-sized snapshot is smaller than cache).
+    for (int i = 0; i < n_full_attn; i++) {
+        ggml_tensor * sk = cache.attn_k[i];
+        ggml_tensor * dk = snap.attn_k_snap[i];
+        ggml_tensor * sv = cache.attn_v[i];
+        ggml_tensor * dv = snap.attn_v_snap[i];
+        if (!sk || !dk || !sv || !dv) continue;
+        const size_t k_strip = (size_t)snap_pos * sk->nb[1];
+        const size_t v_strip = (size_t)snap_pos * sv->nb[1];
+        for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
+            size_t src_off = (size_t)kh * sk->nb[2];
+            size_t dst_off = (size_t)kh * dk->nb[2];
+            ggml_backend_tensor_get(sk, (char *)dk->data + dst_off, src_off, k_strip);
+        }
+        for (int kh = 0; kh < (int)sv->ne[2]; kh++) {
+            size_t src_off = (size_t)kh * sv->nb[2];
+            size_t dst_off = (size_t)kh * dv->nb[2];
+            ggml_backend_tensor_get(sv, (char *)dv->data + dst_off, src_off, v_strip);
+        }
+    }
+
+    // SSM/conv: full copy (fixed-size, same shapes).
+    for (int i = 0; i < n_delta; i++) {
+        if (!cache.ssm_state[i] || !snap.ssm_state_snap[i] ||
+            !cache.conv_state[i] || !snap.conv_state_snap[i]) {
+            continue;
+        }
+        ggml_backend_tensor_copy(cache.ssm_state[i],  snap.ssm_state_snap[i]);
+        ggml_backend_tensor_copy(cache.conv_state[i], snap.conv_state_snap[i]);
+    }
+
+    // target_feat: partial copy of first min(snap_pos, cap) rows.
+    if (cache.target_feat && snap.target_feat_snap) {
+        const size_t feat_nbytes = ggml_nbytes(snap.target_feat_snap);
+        ggml_backend_tensor_get(cache.target_feat, snap.target_feat_snap->data, 0, feat_nbytes);
+    }
+
+    snap.cur_pos         = snap_pos;
+    snap.last_tok        = cache.last_tok;
+    snap.kv_k_type       = cache.kv_k_type;
+    snap.max_ctx         = cache.max_ctx;
+    snap.target_feat_cap = cache.target_feat_cap;
+    snap.layout          = PrefixSnapshot::Layout::dense;
+
+    return true;
+}
+
+bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
+    if (snap.layout != PrefixSnapshot::Layout::dense) {
+        set_last_error("restore_target_cache: snapshot is not dense");
+        return false;
+    }
+    if (cache.n_seq_slots > 1) {
+        set_last_error("restore_target_cache: multi-slot caches are unsupported");
+        return false;
+    }
+    if (snap.kv_k_type != cache.kv_k_type) {
+        set_last_error("restore_target_cache: kv_k_type mismatch");
+        return false;
+    }
+    if (snap.max_ctx != cache.max_ctx) {
+        set_last_error("restore_target_cache: max_ctx mismatch");
+        return false;
+    }
+    // Topology: snapshot must describe the same model layout the cache was
+    // allocated against. A mismatch (stale snapshot from a different daemon
+    // run, or a snap captured before a model swap) would index past
+    // cache.attn_k / .ssm_state / .conv_state and silently corrupt memory.
+    if (snap.attn_k_snap.size() != cache.attn_k.size() ||
+        snap.attn_v_snap.size() != cache.attn_v.size() ||
+        snap.ssm_state_snap.size()  != cache.ssm_state.size() ||
+        snap.conv_state_snap.size() != cache.conv_state.size()) {
+        set_last_error("restore_target_cache: layer-count mismatch (stale snapshot?)");
+        return false;
+    }
+    if (snap.cur_pos < 0 || snap.cur_pos > cache.max_ctx) {
+        set_last_error("restore_target_cache: snap.cur_pos out of range");
+        return false;
+    }
+
+    const int n_full_attn = (int)snap.attn_k_snap.size();
+    const int n_delta     = (int)snap.ssm_state_snap.size();
+    const int snap_pos    = snap.cur_pos;
+
+    // KV: strip-by-strip copy from right-sized snapshot into full-size cache.
+    for (int i = 0; i < n_full_attn; i++) {
+        ggml_tensor * sk = snap.attn_k_snap[i];
+        ggml_tensor * dk = cache.attn_k[i];
+        ggml_tensor * sv = snap.attn_v_snap[i];
+        ggml_tensor * dv = cache.attn_v[i];
+        if ((!sk || !sv) != (!dk || !dv)) {
+            set_last_error("restore_target_cache: KV shard layout mismatch");
+            return false;
+        }
+        if (!sk || !dk || !sv || !dv) continue;
+        const size_t k_strip = (size_t)snap_pos * sk->nb[1];
+        const size_t v_strip = (size_t)snap_pos * sv->nb[1];
+        for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
+            size_t src_off = (size_t)kh * sk->nb[2];
+            size_t dst_off = (size_t)kh * dk->nb[2];
+            ggml_backend_tensor_set(dk, (const char *)sk->data + src_off, dst_off, k_strip);
+        }
+        for (int kh = 0; kh < (int)sv->ne[2]; kh++) {
+            size_t src_off = (size_t)kh * sv->nb[2];
+            size_t dst_off = (size_t)kh * dv->nb[2];
+            ggml_backend_tensor_set(dv, (const char *)sv->data + src_off, dst_off, v_strip);
+        }
+    }
+
+    // SSM/conv: full copy (fixed-size).
+    for (int i = 0; i < n_delta; i++) {
+        if ((!snap.ssm_state_snap[i] || !snap.conv_state_snap[i]) !=
+            (!cache.ssm_state[i] || !cache.conv_state[i])) {
+            set_last_error("restore_target_cache: recurrent shard layout mismatch");
+            return false;
+        }
+        if (!snap.ssm_state_snap[i] || !cache.ssm_state[i] ||
+            !snap.conv_state_snap[i] || !cache.conv_state[i]) {
+            continue;
+        }
+        ggml_backend_tensor_copy(snap.ssm_state_snap[i],  cache.ssm_state[i]);
+        ggml_backend_tensor_copy(snap.conv_state_snap[i], cache.conv_state[i]);
+    }
+
+    // target_feat: partial copy of stored rows.
+    if (cache.target_feat && snap.target_feat_snap) {
+        const size_t feat_nbytes = ggml_nbytes(snap.target_feat_snap);
+        ggml_backend_tensor_set(cache.target_feat, snap.target_feat_snap->data, 0, feat_nbytes);
+    }
+
+    cache.cur_pos  = snap.cur_pos;
+    cache.last_tok = snap.last_tok;
+
+    return true;
+}
+
+namespace {
+
+size_t blocks_for_prefix(int tokens, int block_size) {
+    return tokens <= 0 ? 0 :
+        ((size_t)tokens + (size_t)block_size - 1) / (size_t)block_size;
+}
+
+size_t contiguous_block_run(
+        const std::vector<uint32_t> & blocks,
+        size_t first,
+        size_t block_count) {
+    size_t run = 1;
+    while (first + run < block_count &&
+           (uint64_t)blocks[first + run] ==
+               (uint64_t)blocks[first + run - 1] + 1) {
+        ++run;
+    }
+    return run;
+}
+
+bool paged_tensor_layout_matches(
+        const ggml_tensor * dense, const ggml_tensor * paged,
+        int tokens) {
+    return dense && paged && dense->type == paged->type &&
+        dense->ne[0] == paged->ne[0] && dense->ne[1] == tokens &&
+        dense->ne[2] == paged->ne[2] && dense->ne[3] == paged->ne[3] &&
+        ggml_is_contiguous(dense) && ggml_is_contiguous(paged);
+}
+
+bool paged_rows_fit(
+        const ggml_tensor * tensor,
+        const std::vector<uint32_t> & blocks,
+        int block_size,
+        int tokens) {
+    if (!tensor || block_size <= 0 || tokens <= 0 ||
+        blocks.size() < blocks_for_prefix(tokens, block_size)) {
+        return false;
+    }
+    for (size_t logical = 0;
+         logical < blocks_for_prefix(tokens, block_size); ++logical) {
+        const uint64_t first =
+            (uint64_t)blocks[logical] * (uint64_t)block_size;
+        const int remaining = tokens - (int)logical * block_size;
+        const uint64_t count = (uint64_t)std::min(block_size, remaining);
+        if (first + count > (uint64_t)tensor->ne[1]) return false;
+    }
+    return true;
+}
+
+ggml_backend_buffer_type_t paged_snapshot_buffer_type() {
+    // Paged gather/scatter passes snapshot tensor data to get/set as host
+    // staging, so even unified-memory compute backends need true CPU storage.
+    return ggml_backend_cpu_buffer_type();
+}
+
+enum class PagedCopyDirection { gather, scatter };
+
+void copy_paged_tensor(
+        ggml_backend_t backend,
+        ggml_tensor * dense, ggml_tensor * paged,
+        const std::vector<uint32_t> & blocks,
+        int block_size, int tokens, PagedCopyDirection direction) {
+    const size_t block_count = blocks_for_prefix(tokens, block_size);
+    for (int head = 0; head < (int)paged->ne[2]; ++head) {
+        for (size_t logical = 0; logical < block_count;) {
+            const size_t run =
+                contiguous_block_run(blocks, logical, block_count);
+            const int logical_row = (int)logical * block_size;
+            const int count = std::min(
+                (int)run * block_size, tokens - logical_row);
+            const size_t bytes = (size_t)count * paged->nb[1];
+            const size_t paged_row =
+                (size_t)blocks[logical] * (size_t)block_size;
+            const size_t paged_offset =
+                (size_t)head * paged->nb[2] + paged_row * paged->nb[1];
+            const size_t dense_offset =
+                (size_t)head * dense->nb[2] +
+                (size_t)logical_row * dense->nb[1];
+            if (direction == PagedCopyDirection::gather) {
+                ggml_backend_tensor_get_async(
+                    backend, paged, (char *)dense->data + dense_offset,
+                    paged_offset, bytes);
+            } else {
+                ggml_backend_tensor_set_async(
+                    backend, paged, (const char *)dense->data + dense_offset,
+                    paged_offset, bytes);
+            }
+            logical += run;
+        }
+    }
+}
+
+bool recurrent_slab_matches(
+        const ggml_tensor * dense, const ggml_tensor * slotted,
+        int n_slots, int slot_axis) {
+    if (!dense || !slotted || n_slots < 1 || slot_axis < 0 ||
+        slot_axis >= GGML_MAX_DIMS || dense->type != slotted->type ||
+        !ggml_is_contiguous(dense) || !ggml_is_contiguous(slotted) ||
+        slotted->ne[slot_axis] != n_slots ||
+        dense->ne[slot_axis] != 1) return false;
+    for (int axis = 0; axis < GGML_MAX_DIMS; ++axis) {
+        if (axis != slot_axis && dense->ne[axis] != slotted->ne[axis])
+            return false;
+    }
+    return ggml_nbytes(dense) ==
+        ggml_nbytes(slotted) / (size_t)n_slots;
+}
+
+bool paged_cache_pairs_complete(const TargetCache & cache) {
+    if (cache.attn_k.size() != cache.attn_v.size() ||
+        cache.ssm_state.size() != cache.conv_state.size()) return false;
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        if ((cache.attn_k[i] == nullptr) !=
+            (cache.attn_v[i] == nullptr)) return false;
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        if ((cache.ssm_state[i] == nullptr) !=
+            (cache.conv_state[i] == nullptr)) return false;
+    }
+    return true;
+}
+
+bool create_paged_snapshot_layout(
+        const TargetCache & cache, int token_count, PrefixSnapshot & snap) {
+    const int total_tensors = 2 * (int)cache.attn_k.size() +
+        2 * (int)cache.ssm_state.size();
+    ggml_init_params params{};
+    params.mem_size =
+        (size_t)(total_tensors + 16) * ggml_tensor_overhead();
+    params.no_alloc = true;
+    snap.ctx = ggml_init(params);
+    if (!snap.ctx) return false;
+
+    snap.attn_k_snap.assign(cache.attn_k.size(), nullptr);
+    snap.attn_v_snap.assign(cache.attn_v.size(), nullptr);
+    snap.ssm_state_snap.assign(cache.ssm_state.size(), nullptr);
+    snap.conv_state_snap.assign(cache.conv_state.size(), nullptr);
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        if (!cache.attn_k[i]) continue;
+        snap.attn_k_snap[i] = ggml_new_tensor_3d(
+            snap.ctx, cache.attn_k[i]->type, cache.attn_k[i]->ne[0],
+            token_count, cache.attn_k[i]->ne[2]);
+        snap.attn_v_snap[i] = ggml_new_tensor_3d(
+            snap.ctx, cache.attn_v[i]->type, cache.attn_v[i]->ne[0],
+            token_count, cache.attn_v[i]->ne[2]);
+        char name[64];
+        std::snprintf(name, sizeof(name), "snap_cache_k_%zu", i);
+        ggml_set_name(snap.attn_k_snap[i], name);
+        std::snprintf(name, sizeof(name), "snap_cache_v_%zu", i);
+        ggml_set_name(snap.attn_v_snap[i], name);
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        if (!cache.ssm_state[i]) continue;
+        const ggml_tensor * ssm = cache.ssm_state[i];
+        const ggml_tensor * conv = cache.conv_state[i];
+        snap.ssm_state_snap[i] = ggml_new_tensor_3d(
+            snap.ctx, ssm->type, ssm->ne[0], ssm->ne[1], ssm->ne[2]);
+        snap.conv_state_snap[i] = ggml_new_tensor_2d(
+            snap.ctx, conv->type, conv->ne[0], conv->ne[1]);
+        char name[64];
+        std::snprintf(name, sizeof(name), "snap_ssm_state_%zu", i);
+        ggml_set_name(snap.ssm_state_snap[i], name);
+        std::snprintf(name, sizeof(name), "snap_conv_state_%zu", i);
+        ggml_set_name(snap.conv_state_snap[i], name);
+    }
+    return true;
+}
+
+bool paged_snapshot_matches(
+        const TargetCache & cache, const PrefixSnapshot & snap,
+        const std::vector<uint32_t> & blocks, int block_size, int tokens) {
+    if (!paged_cache_pairs_complete(cache) ||
+        snap.attn_k_snap.size() != cache.attn_k.size() ||
+        snap.attn_v_snap.size() != cache.attn_v.size() ||
+        snap.ssm_state_snap.size() != cache.ssm_state.size() ||
+        snap.conv_state_snap.size() != cache.conv_state.size()) return false;
+
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        const bool present = cache.attn_k[i] != nullptr;
+        if ((snap.attn_k_snap[i] != nullptr) != present ||
+            (snap.attn_v_snap[i] != nullptr) != present) return false;
+        if (present &&
+            (!paged_tensor_layout_matches(
+                 snap.attn_k_snap[i], cache.attn_k[i], tokens) ||
+             !paged_tensor_layout_matches(
+                 snap.attn_v_snap[i], cache.attn_v[i], tokens) ||
+             !paged_rows_fit(cache.attn_k[i], blocks, block_size, tokens) ||
+             !paged_rows_fit(cache.attn_v[i], blocks, block_size, tokens))) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        const bool present = cache.ssm_state[i] != nullptr;
+        if ((snap.ssm_state_snap[i] != nullptr) != present ||
+            (snap.conv_state_snap[i] != nullptr) != present) return false;
+        if (present &&
+            (!recurrent_slab_matches(
+                 snap.ssm_state_snap[i], cache.ssm_state[i],
+                 cache.n_seq_slots, /*slot_axis=*/3) ||
+             !recurrent_slab_matches(
+                 snap.conv_state_snap[i], cache.conv_state[i],
+                 cache.n_seq_slots, /*slot_axis=*/2))) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+size_t estimate_paged_target_cache_snapshot_bytes(
+        const TargetCache & cache,
+        int token_count) {
+    if (cache.n_seq_slots < 1 || token_count <= 0 ||
+        token_count > cache.max_ctx || !paged_cache_pairs_complete(cache)) {
+        return 0;
+    }
+
+    PrefixSnapshot layout;
+    if (!create_paged_snapshot_layout(cache, token_count, layout)) return 0;
+    const size_t bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(
+        layout.ctx,
+        paged_snapshot_buffer_type());
+    free_prefix_snapshot(layout);
+    return bytes;
+}
+
+bool snapshot_paged_target_cache(
+        const TargetCache & cache,
+        int seq_slot,
+        const std::vector<uint32_t> & block_table,
+        int block_size,
+        int token_count,
+        PrefixSnapshot & snap) {
+    if (!cache.backend || cache.n_seq_slots < 1 || seq_slot < 0 ||
+        seq_slot >= cache.n_seq_slots || token_count <= 0 ||
+        token_count > cache.max_ctx || block_size <= 0 ||
+        block_table.size() < blocks_for_prefix(token_count, block_size) ||
+        !paged_cache_pairs_complete(cache)) {
+        set_last_error("snapshot_paged_target_cache: invalid arguments");
+        return false;
+    }
+    const bool needs_alloc = !snap.ctx ||
+        snap.layout != PrefixSnapshot::Layout::paged ||
+        snap.cur_pos != token_count ||
+        snap.attn_k_snap.size() != cache.attn_k.size() ||
+        snap.attn_v_snap.size() != cache.attn_v.size() ||
+        snap.ssm_state_snap.size() != cache.ssm_state.size() ||
+        snap.conv_state_snap.size() != cache.conv_state.size();
+    if (needs_alloc) {
+        free_prefix_snapshot(snap);
+        if (!create_paged_snapshot_layout(cache, token_count, snap)) {
+            set_last_error("paged PrefixSnapshot ggml_init failed");
+            return false;
+        }
+        snap.buf = ggml_backend_alloc_ctx_tensors_from_buft(
+            snap.ctx, paged_snapshot_buffer_type());
+        if (!snap.buf) {
+            set_last_error("paged PrefixSnapshot buffer allocation failed");
+            free_prefix_snapshot(snap);
+            return false;
+        }
+    }
+
+    if (!paged_snapshot_matches(
+            cache, snap, block_table, block_size, token_count)) {
+        set_last_error("paged snapshot layout mismatch");
+        free_prefix_snapshot(snap);
+        return false;
+    }
+
+    // Validate the entire topology before submitting any transfers. Then queue
+    // every logical K/V run and recurrent slab and synchronize once, avoiding
+    // one device-wide scheduler stall per tensor/run.
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        if (!cache.attn_k[i]) continue;
+        copy_paged_tensor(
+            cache.backend, snap.attn_k_snap[i], cache.attn_k[i],
+            block_table, block_size, token_count,
+            PagedCopyDirection::gather);
+        copy_paged_tensor(
+            cache.backend, snap.attn_v_snap[i], cache.attn_v[i],
+            block_table, block_size, token_count,
+            PagedCopyDirection::gather);
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        if (!cache.ssm_state[i]) continue;
+        const size_t ssm_bytes = ggml_nbytes(snap.ssm_state_snap[i]);
+        const size_t conv_bytes = ggml_nbytes(snap.conv_state_snap[i]);
+        ggml_backend_tensor_get_async(
+            cache.backend,
+            cache.ssm_state[i], snap.ssm_state_snap[i]->data,
+            (size_t)seq_slot * ssm_bytes, ssm_bytes);
+        ggml_backend_tensor_get_async(
+            cache.backend,
+            cache.conv_state[i], snap.conv_state_snap[i]->data,
+            (size_t)seq_slot * conv_bytes, conv_bytes);
+    }
+    ggml_backend_synchronize(cache.backend);
+    snap.cur_pos = token_count;
+    snap.last_tok = -1;
+    snap.kv_k_type = cache.kv_k_type;
+    snap.max_ctx = cache.max_ctx;
+    snap.target_feat_cap = 0;
+    snap.target_feat_snap = nullptr;
+    snap.layout = PrefixSnapshot::Layout::paged;
+    return true;
+}
+
+bool replace_paged_target_cache(
+        const TargetCache & cache,
+        int seq_slot,
+        const std::vector<uint32_t> & block_table,
+        int block_size,
+        int token_count,
+        PrefixSnapshot & destination) {
+    PrefixSnapshot candidate;
+    if (!snapshot_paged_target_cache(
+            cache, seq_slot, block_table, block_size, token_count,
+            candidate)) {
+        free_prefix_snapshot(candidate);
+        return false;
+    }
+    using std::swap;
+    swap(candidate, destination);
+    free_prefix_snapshot(candidate);
+    return true;
+}
+
+bool restore_paged_target_cache(
+        const PrefixSnapshot & snap,
+        TargetCache & cache,
+        int seq_slot,
+        const std::vector<uint32_t> & block_table,
+        int block_size) {
+    if (!snap.ctx || snap.layout != PrefixSnapshot::Layout::paged ||
+        !cache.backend ||
+        cache.n_seq_slots < 1 ||
+        seq_slot < 0 || seq_slot >= cache.n_seq_slots || block_size <= 0 ||
+        snap.cur_pos <= 0 || snap.cur_pos > cache.max_ctx ||
+        snap.max_ctx != cache.max_ctx || snap.kv_k_type != cache.kv_k_type ||
+        block_table.size() < blocks_for_prefix(snap.cur_pos, block_size) ||
+        !paged_snapshot_matches(
+            cache, snap, block_table, block_size, snap.cur_pos)) {
+        set_last_error("restore_paged_target_cache: incompatible checkpoint");
+        return false;
+    }
+    for (size_t i = 0; i < cache.attn_k.size(); ++i) {
+        if (!cache.attn_k[i]) continue;
+        copy_paged_tensor(
+            cache.backend, snap.attn_k_snap[i], cache.attn_k[i],
+            block_table, block_size, snap.cur_pos,
+            PagedCopyDirection::scatter);
+        copy_paged_tensor(
+            cache.backend, snap.attn_v_snap[i], cache.attn_v[i],
+            block_table, block_size, snap.cur_pos,
+            PagedCopyDirection::scatter);
+    }
+    for (size_t i = 0; i < cache.ssm_state.size(); ++i) {
+        if (!cache.ssm_state[i]) continue;
+        const size_t ssm_bytes = ggml_nbytes(snap.ssm_state_snap[i]);
+        const size_t conv_bytes = ggml_nbytes(snap.conv_state_snap[i]);
+        ggml_backend_tensor_set_async(
+            cache.backend,
+            cache.ssm_state[i], snap.ssm_state_snap[i]->data,
+            (size_t)seq_slot * ssm_bytes, ssm_bytes);
+        ggml_backend_tensor_set_async(
+            cache.backend,
+            cache.conv_state[i], snap.conv_state_snap[i]->data,
+            (size_t)seq_slot * conv_bytes, conv_bytes);
+    }
+    ggml_backend_synchronize(cache.backend);
+    return true;
+}
+
+void free_prefix_snapshot(PrefixSnapshot & snap) {
+    if (snap.buf) { ggml_backend_buffer_free(snap.buf); snap.buf = nullptr; }
+    if (snap.ctx) { ggml_free(snap.ctx);                snap.ctx = nullptr; }
+    snap.attn_k_snap.clear();
+    snap.attn_v_snap.clear();
+    snap.ssm_state_snap.clear();
+    snap.conv_state_snap.clear();
+    snap.target_feat_snap = nullptr;
+    snap.cur_pos         = 0;
+    snap.kv_k_type       = GGML_TYPE_COUNT;
+    snap.max_ctx         = 0;
+    snap.target_feat_cap = 0;
+    snap.layout          = PrefixSnapshot::Layout::empty;
+    snap.kv_start        = 0;
+    snap.kv_end          = 0;
+}
+
+bool snapshot_target_cache_thin(const TargetWeights & w,
+                                 const TargetCache & cache,
+                                 ggml_backend_t backend,
+                                 int kv_start,
+                                 int kv_end,
+                                 PrefixSnapshot & snap) {
+    if (kv_end <= kv_start || kv_start < 0 || kv_end > cache.max_ctx) {
+        set_last_error("snapshot_thin: invalid kv range");
+        return false;
+    }
+    // Capturing past cur_pos would snapshot uninitialized KV data — the
+    // restore path would then resume decode from garbage state.
+    if (kv_end > cache.cur_pos) {
+        set_last_error("snapshot_thin: kv_end exceeds cache.cur_pos (would capture uninitialized KV)");
+        return false;
+    }
+    const int n_full_attn = w.n_layer / w.full_attention_interval;
+    const int block_size  = kv_end - kv_start;
+
+    // Lazy alloc; if snap was already a THIN with same range, reuse.
+    bool needs_alloc = (snap.ctx == nullptr) ||
+                       snap.layout != PrefixSnapshot::Layout::thin ||
+                       snap.kv_start != kv_start ||
+                       snap.kv_end   != kv_end;
+    if (needs_alloc) {
+        free_prefix_snapshot(snap);
+        const int total_tensors = 2 * n_full_attn;
+        ggml_init_params ip{};
+        ip.mem_size   = (size_t)(total_tensors + 16) * ggml_tensor_overhead();
+        ip.mem_buffer = nullptr;
+        ip.no_alloc   = true;
+        snap.ctx = ggml_init(ip);
+        if (!snap.ctx) { set_last_error("PrefixSnapshot thin ggml_init failed"); return false; }
+        snap.attn_k_snap.assign(n_full_attn, nullptr);
+        snap.attn_v_snap.assign(n_full_attn, nullptr);
+        // SSM/conv/target_feat NOT allocated for thin.
+        for (int i = 0; i < n_full_attn; i++) {
+            ggml_tensor * sk = cache.attn_k[i];
+            ggml_tensor * sv = cache.attn_v[i];
+            // Tightly-packed shape [HEAD_DIM, block_size, N_HEAD_KV]
+            snap.attn_k_snap[i] = ggml_new_tensor_3d(snap.ctx, sk->type,
+                                                      sk->ne[0], block_size, sk->ne[2]);
+            snap.attn_v_snap[i] = ggml_new_tensor_3d(snap.ctx, sv->type,
+                                                      sv->ne[0], block_size, sv->ne[2]);
+            char name[64];
+            std::snprintf(name, sizeof(name), "snap_thin_k_%d", i);
+            ggml_set_name(snap.attn_k_snap[i], name);
+            std::snprintf(name, sizeof(name), "snap_thin_v_%d", i);
+            ggml_set_name(snap.attn_v_snap[i], name);
+        }
+        snap.buf = ggml_backend_alloc_ctx_tensors(snap.ctx, backend);
+        if (!snap.buf) {
+            set_last_error("thin snap alloc failed");
+            ggml_free(snap.ctx);
+            snap.ctx = nullptr;
+            snap.attn_k_snap.clear();
+            snap.attn_v_snap.clear();
+            return false;
+        }
+    }
+
+    // Copy strip-by-strip.
+    for (int i = 0; i < n_full_attn; i++) {
+        ggml_tensor * sk = cache.attn_k[i];
+        ggml_tensor * sv = cache.attn_v[i];
+        ggml_tensor * dk = snap.attn_k_snap[i];
+        ggml_tensor * dv = snap.attn_v_snap[i];
+        const size_t k_strip = (size_t)block_size * sk->nb[1];
+        const size_t v_strip = (size_t)block_size * sv->nb[1];
+        std::vector<uint8_t> bufk(k_strip), bufv(v_strip);
+        for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
+            size_t k_src = (size_t)kh * sk->nb[2] + (size_t)kv_start * sk->nb[1];
+            size_t k_dst = (size_t)kh * dk->nb[2];
+            ggml_backend_tensor_get(sk, bufk.data(), k_src, k_strip);
+            ggml_backend_tensor_set(dk, bufk.data(), k_dst, k_strip);
+            size_t v_src = (size_t)kh * sv->nb[2] + (size_t)kv_start * sv->nb[1];
+            size_t v_dst = (size_t)kh * dv->nb[2];
+            ggml_backend_tensor_get(sv, bufv.data(), v_src, v_strip);
+            ggml_backend_tensor_set(dv, bufv.data(), v_dst, v_strip);
+        }
+    }
+    snap.layout    = PrefixSnapshot::Layout::thin;
+    snap.kv_start  = kv_start;
+    snap.kv_end    = kv_end;
+    snap.cur_pos   = kv_end;
+    snap.kv_k_type = cache.kv_k_type;
+    snap.max_ctx   = cache.max_ctx;
+    return true;
+}
+
+bool restore_target_cache_chain(const PrefixSnapshot * thick,
+                                 const PrefixSnapshot * const * thins,
+                                 int n_thins,
+                                 TargetCache & cache) {
+    // Step 1: restore thick base if provided.
+    if (thick) {
+        if (thick->layout == PrefixSnapshot::Layout::thin) {
+            set_last_error("restore_chain: 'thick' arg is actually a thin snapshot");
+            return false;
+        }
+        if (!restore_target_cache(*thick, cache)) return false;
+    }
+    // Step 2: layer thins into KV cache at their respective ranges.
+    int max_kv_end = cache.cur_pos;
+    for (int t = 0; t < n_thins; t++) {
+        const PrefixSnapshot * thin = thins[t];
+        if (thin->layout != PrefixSnapshot::Layout::thin) {
+            set_last_error("restore_chain: 'thin' arg has the wrong layout");
+            return false;
+        }
+        if (thin->kv_k_type != cache.kv_k_type ||
+            thin->max_ctx   != cache.max_ctx) {
+            set_last_error("restore_chain: thin kv_k_type/max_ctx mismatch");
+            return false;
+        }
+        const int block_size = thin->kv_end - thin->kv_start;
+        for (int i = 0; i < (int)cache.attn_k.size(); i++) {
+            ggml_tensor * sk = thin->attn_k_snap[i];
+            ggml_tensor * sv = thin->attn_v_snap[i];
+            ggml_tensor * dk = cache.attn_k[i];
+            ggml_tensor * dv = cache.attn_v[i];
+            const size_t k_strip = (size_t)block_size * dk->nb[1];
+            const size_t v_strip = (size_t)block_size * dv->nb[1];
+            std::vector<uint8_t> bufk(k_strip), bufv(v_strip);
+            for (int kh = 0; kh < (int)dk->ne[2]; kh++) {
+                size_t k_src = (size_t)kh * sk->nb[2];
+                size_t k_dst = (size_t)kh * dk->nb[2] + (size_t)thin->kv_start * dk->nb[1];
+                ggml_backend_tensor_get(sk, bufk.data(), k_src, k_strip);
+                ggml_backend_tensor_set(dk, bufk.data(), k_dst, k_strip);
+                size_t v_src = (size_t)kh * sv->nb[2];
+                size_t v_dst = (size_t)kh * dv->nb[2] + (size_t)thin->kv_start * dv->nb[1];
+                ggml_backend_tensor_get(sv, bufv.data(), v_src, v_strip);
+                ggml_backend_tensor_set(dv, bufv.data(), v_dst, v_strip);
+            }
+        }
+        if (thin->kv_end > max_kv_end) max_kv_end = thin->kv_end;
+    }
+    cache.cur_pos = max_kv_end;
+    // Note: cache.last_tok is NOT updated by chain restore; the caller must
+    // ensure that the LAST thin's kv_end matches the prompt position where
+    // last_tok was captured, or fall back to bare-prompt prefill afterward.
+    return true;
+}
+
+
+} // namespace dflash::common
